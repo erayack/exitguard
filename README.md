@@ -35,6 +35,7 @@ Build the image first with `make docker-build IMG=…`, then push via your usual
 | --- | --- |
 | [Architecture](docs/architecture.md) | Controllers, CRDs, and safety model |
 | [Operations](docs/operations.md) | Day-2 runbooks and recovery |
+| [Performance](docs/performance.md) | Reproducible benchmarks, profiles, and interpretation limits |
 | [Security](SECURITY.md) | Privilege model and disclosure |
 
 ## Develop

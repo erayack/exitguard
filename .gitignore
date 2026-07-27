@@ -1,5 +1,6 @@
 /bin/
 /cover.out
 /.envtest/
+/.perf/
 .DS_Store
 .pi/

@@ -75,6 +75,30 @@ manifests-check:
 test-e2e:
 	K8S_VERSION=$(ENVTEST_K8S_VERSION) PROFILE=remediation ./hack/kind-e2e.sh
 
+.PHONY: perf
+perf:
+	GO=$(GO) ./hack/perf.sh run
+
+.PHONY: perf-full
+perf-full:
+	GO=$(GO) ./hack/perf.sh full
+
+.PHONY: perf-profile
+perf-profile:
+	GO=$(GO) BENCH='$(BENCH)' ./hack/perf.sh profile
+
+.PHONY: perf-profile-alloc
+perf-profile-alloc:
+	GO=$(GO) BENCH='$(BENCH)' ./hack/perf.sh profile-alloc
+
+.PHONY: perf-compare
+perf-compare:
+	GO=$(GO) BASE='$(BASE)' ./hack/perf.sh compare
+
+.PHONY: perf-clean
+perf-clean:
+	GO=$(GO) ./hack/perf.sh clean
+
 .PHONY: deploy
 deploy: manifests manifests-check
 	$(KUBECTL) apply -k config/default

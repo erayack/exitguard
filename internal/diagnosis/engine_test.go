@@ -671,7 +671,7 @@ type policyOptions struct {
 	owners              []safetyv1alpha1.FinalizerOwner
 }
 
-func diagnosisPolicy(t *testing.T, catalog catalogdiscovery.Snapshot, options policyOptions) *policyengine.CompiledPolicy {
+func diagnosisPolicy(t testing.TB, catalog catalogdiscovery.Snapshot, options policyOptions) *policyengine.CompiledPolicy {
 	t.Helper()
 	maxRisk := options.maxRisk
 	if maxRisk == "" {
@@ -709,7 +709,7 @@ func diagnosisPolicy(t *testing.T, catalog catalogdiscovery.Snapshot, options po
 	return compiled
 }
 
-func diagnosisCatalog(t *testing.T) catalogdiscovery.Snapshot {
+func diagnosisCatalog(t testing.TB) catalogdiscovery.Snapshot {
 	t.Helper()
 	client := staticDiscovery{
 		resources: []*metav1.APIResourceList{

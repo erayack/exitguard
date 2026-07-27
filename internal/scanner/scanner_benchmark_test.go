@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,61 +39,85 @@ import (
 	safetyv1alpha1 "github.com/erayack/exitguard/api/v1alpha1"
 	"github.com/erayack/exitguard/internal/diagnosis"
 	catalogdiscovery "github.com/erayack/exitguard/internal/discovery"
+	"github.com/erayack/exitguard/internal/perftest"
 )
 
-const (
-	benchmarkResourceCount   = 20
-	benchmarkObjectsPerType  = 500
-	benchmarkDeletingTargets = 100
-	benchmarkPolicyCount     = 20
-	benchmarkPageSize        = 100
-)
+var scannerBenchmarkScales = []perftest.Scale{
+	{Name: "StubSmall", Policies: 3, Resources: 3, Objects: 40, PageSize: 20},
+	{Name: "StubMedium", Policies: 8, Resources: 8, Objects: 200, PageSize: 50},
+	{Name: "StubFullLarge", Policies: 20, Resources: 20, Objects: 500, PageSize: 100},
+}
 
-// BenchmarkScannerCycleFixedScale exercises a complete scanner cycle at a stable
-// 10k-object cluster scale. Fixture construction and one priming cycle are kept
-// outside the timed region so results represent steady-state cycle cost.
-func BenchmarkScannerCycleFixedScale(b *testing.B) {
-	fixture := newScannerCycleBenchmarkFixture(b)
-	ctx := context.Background()
-	fixture.advance()
-	if err := fixture.coordinator.RunCycle(ctx); err != nil {
-		b.Fatalf("prime scanner cycle: %v", err)
+// BenchmarkScannerCycle measures complete steady-state RunCycle work. Start is
+// intentionally excluded: it adds ticker scheduling rather than scanner work
+// and cannot be benchmarked deterministically without sleeping. StubFullLarge
+// is reserved for the explicit full suite.
+func BenchmarkScannerCycle(b *testing.B) {
+	for _, scale := range scannerBenchmarkScales {
+		scale := scale
+		b.Run(scale.Name, func(b *testing.B) {
+			fixture := newScannerBenchmarkFixture(b, scale, true)
+			fixture.counters.Reset()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if err := fixture.coordinator.RunCycle(context.Background()); err != nil {
+					fixture.counters.Record(perftest.Mismatch)
+					b.Fatalf("scanner cycle: %v", err)
+				}
+			}
+			b.StopTimer()
+			fixture.verify(b)
+			fixture.checkOperations(b, steadyScannerOperations(scale, int64(b.N)))
+			fixture.report(b, b.N)
+		})
 	}
+}
 
-	fixture.resetCounters()
+// BenchmarkScannerLifecycle measures a cold complete cycle with deterministic
+// create, active/failed status refresh, resolution, retention deletion, policy
+// status, and metrics-list paths. Per-iteration state is built and verified
+// outside timing. The small scale keeps this routine benchmark practical.
+func BenchmarkScannerLifecycle(b *testing.B) {
+	scale := scannerBenchmarkScales[0]
+	var aggregate perftest.Counters
 	b.ReportAllocs()
 	b.ResetTimer()
-	for range b.N {
-		fixture.advance()
-		if err := fixture.coordinator.RunCycle(ctx); err != nil {
-			fixture.mismatches.Add(1)
-			b.Fatalf("scanner cycle: %v", err)
-		}
-	}
 	b.StopTimer()
-
-	fixture.verify(b)
-	cycles := float64(b.N)
-	b.ReportMetric(float64(benchmarkResourceCount*benchmarkObjectsPerType), "objects/cycle")
-	b.ReportMetric(float64(fixture.incidentLists.incidentLists.Load())/cycles, "incident_list_calls/cycle")
-	b.ReportMetric(float64(fixture.metadata.listCalls.Load())/cycles, "metadata_list_calls/cycle")
-	b.ReportMetric(float64(fixture.statusWrites.Load())/cycles, "status_writes/cycle")
-	b.ReportMetric(float64(benchmarkDeletingTargets), "fixture_deleting_targets/cycle")
-	b.ReportMetric(float64(fixture.mismatches.Load())/cycles, "result_mismatches/cycle")
+	for range b.N {
+		fixture := newScannerBenchmarkFixtureWithCounters(b, scale, false, &aggregate)
+		b.StartTimer()
+		err := fixture.coordinator.RunCycle(context.Background())
+		b.StopTimer()
+		if err != nil {
+			aggregate.Record(perftest.Mismatch)
+			b.Fatalf("scanner lifecycle cycle: %v", err)
+		}
+		fixture.verify(b)
+	}
+	fixture := &scannerBenchmarkFixture{scale: scale, counters: &aggregate, deletingTargets: deletingTargets(scale)}
+	fixture.checkOperations(b, lifecycleScannerOperations(scale, int64(b.N)))
+	fixture.report(b, b.N)
 }
 
-type scannerCycleBenchmarkFixture struct {
-	coordinator   *Coordinator
-	store         client.Client
-	metadata      *benchmarkMetadataClient
-	incidentLists *incidentListCountingReader
-	statusWrites  atomic.Int64
-	mismatches    atomic.Int64
-	now           time.Time
+type scannerBenchmarkFixture struct {
+	coordinator     *Coordinator
+	store           client.Client
+	counters        *perftest.Counters
+	scale           perftest.Scale
+	deletingTargets int
+	now             time.Time
 }
 
-func newScannerCycleBenchmarkFixture(tb testing.TB) *scannerCycleBenchmarkFixture {
+func newScannerBenchmarkFixture(tb testing.TB, scale perftest.Scale, prime bool) *scannerBenchmarkFixture {
+	return newScannerBenchmarkFixtureWithCounters(tb, scale, prime, &perftest.Counters{})
+}
+
+func newScannerBenchmarkFixtureWithCounters(tb testing.TB, scale perftest.Scale, prime bool, counters *perftest.Counters) *scannerBenchmarkFixture {
 	tb.Helper()
+	if err := scale.Validate(); err != nil {
+		tb.Fatal(err)
+	}
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{
 		clientgoscheme.AddToScheme,
@@ -107,191 +130,263 @@ func newScannerCycleBenchmarkFixture(tb testing.TB) *scannerCycleBenchmarkFixtur
 		}
 	}
 
-	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	deletingAt := metav1.NewTime(started.Add(-30 * time.Minute))
-	resourceNames := make([]string, benchmarkResourceCount)
-	apiResources := make([]metav1.APIResource, benchmarkResourceCount)
-	metadataObjects := make(map[schema.GroupVersionResource][]metav1.PartialObjectMetadata, benchmarkResourceCount+1)
-	targets := make(map[string]*unstructured.Unstructured, benchmarkDeletingTargets)
-	objects := make([]client.Object, 0, benchmarkPolicyCount+benchmarkDeletingTargets*2)
-	namespaces := make([]metav1.PartialObjectMetadata, 10)
+	now := perftest.FixedNow()
+	deletingAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	resourceNames := make([]string, scale.Resources)
+	apiResources := make([]metav1.APIResource, scale.Resources)
+	metadataObjects := make(map[schema.GroupVersionResource][]metav1.PartialObjectMetadata, scale.Resources+1)
+	targets := make(map[string]*unstructured.Unstructured, deletingTargets(scale))
+	objects := make([]client.Object, 0, scale.Policies+deletingTargets(scale)+3)
+	namespaces := make([]metav1.PartialObjectMetadata, min(scale.Objects, 10))
 	for i := range namespaces {
-		namespaces[i] = metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"}, ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("ns-%02d", i), Labels: map[string]string{"team": "scanner"}}}
+		namespaces[i] = metav1.PartialObjectMetadata{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"},
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("ns-%02d", i), Labels: map[string]string{"team": "scanner"}},
+		}
 	}
 	metadataObjects[schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}] = namespaces
-	for resourceIndex := range benchmarkResourceCount {
+
+	deletingIndex := 0
+	for resourceIndex := range scale.Resources {
 		resourceName := fmt.Sprintf("resources-%02d", resourceIndex)
 		kind := fmt.Sprintf("Resource%02d", resourceIndex)
+		namespaced := resourceIndex != scale.Resources-1
 		resourceNames[resourceIndex] = resourceName
-		apiResources[resourceIndex] = metav1.APIResource{Name: resourceName, SingularName: fmt.Sprintf("resource-%02d", resourceIndex), Namespaced: true, Kind: kind, Verbs: metav1.Verbs{"get", "list"}}
+		apiResources[resourceIndex] = metav1.APIResource{Name: resourceName, SingularName: fmt.Sprintf("resource-%02d", resourceIndex), Namespaced: namespaced, Kind: kind, Verbs: metav1.Verbs{"get", "list"}}
 		gvr := schema.GroupVersionResource{Group: "benchmark.io", Version: "v1", Resource: resourceName}
-		items := make([]metav1.PartialObjectMetadata, benchmarkObjectsPerType)
-		for objectIndex := range benchmarkObjectsPerType {
+		items := make([]metav1.PartialObjectMetadata, scale.Objects)
+		for objectIndex := range scale.Objects {
 			uid := types.UID(fmt.Sprintf("r%02d-object-%04d", resourceIndex, objectIndex))
 			name := fmt.Sprintf("object-%04d", objectIndex)
-			namespace := fmt.Sprintf("ns-%02d", objectIndex%10)
-			item := metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: "benchmark.io/v1", Kind: kind}, ObjectMeta: metav1.ObjectMeta{
-				Name: name, Namespace: namespace, UID: uid, ResourceVersion: "7",
-				Labels: map[string]string{"environment": "production", "role": "ordinary"},
-			}}
+			namespace := ""
+			if namespaced {
+				namespace = fmt.Sprintf("ns-%02d", objectIndex%len(namespaces))
+			}
+			item := metav1.PartialObjectMetadata{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "benchmark.io/v1", Kind: kind},
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: uid, ResourceVersion: "7", Labels: map[string]string{"environment": "production", "role": "ordinary"}},
+			}
 			if objectIndex%100 == 0 {
 				item.DeletionTimestamp = deletingAt.DeepCopy()
 				item.Finalizers = []string{"benchmark.io/finalizer"}
-				target := &unstructured.Unstructured{Object: map[string]any{
-					"apiVersion": "benchmark.io/v1", "kind": kind,
-					"metadata": map[string]any{"name": name, "namespace": namespace, "uid": string(uid), "resourceVersion": "7", "deletionTimestamp": deletingAt.Format(time.RFC3339), "finalizers": []any{"benchmark.io/finalizer"}, "labels": map[string]any{"environment": "production", "role": "ordinary"}},
-				}}
-				targets[benchmarkTargetKey(gvr, namespace, name)] = target
-				objects = append(objects, benchmarkActiveIncident(started, resourceName, kind, namespace, name, uid, deletingAt))
+				targets[benchmarkTargetKey(gvr, namespace, name)] = benchmarkTarget(gvr, kind, item)
+				switch deletingIndex % 3 {
+				case 1:
+					objects = append(objects, benchmarkLifecycleIncident(now, safetyv1alpha1.IncidentPhaseActive, resourceName, kind, namespace, name, uid, deletingAt))
+				case 2:
+					objects = append(objects, benchmarkLifecycleIncident(now, safetyv1alpha1.IncidentPhaseDiagnosisFailed, resourceName, kind, namespace, name, uid, deletingAt))
+				}
+				deletingIndex++
 			}
 			items[objectIndex] = item
 		}
 		metadataObjects[gvr] = items
 	}
 
-	for i := range benchmarkPolicyCount {
+	for i := range scale.Policies {
 		objects = append(objects, benchmarkPolicy(i, resourceNames))
 	}
-	for i := range benchmarkDeletingTargets {
-		objects = append(objects, benchmarkResolvedIncident(started, i))
-	}
+	objects = append(objects,
+		benchmarkStaleActiveIncident(now, resourceNames[0]),
+		benchmarkResolvedIncident(now, "expired", -2*time.Hour),
+		benchmarkResolvedIncident(now, "retained", -30*time.Minute),
+	)
 
 	store := clientfake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&safetyv1alpha1.TerminationPolicy{}, &safetyv1alpha1.DeletionIncident{}).
 		WithObjects(objects...).Build()
-	metadataClient := &benchmarkMetadataClient{objects: metadataObjects, pageSize: benchmarkPageSize}
-
+	metadataClient := &benchmarkMetadataClient{objects: metadataObjects, pageSize: int64(scale.PageSize), counters: counters}
 	discovery := &fake.FakeDiscovery{Fake: &k8stesting.Fake{}}
-	discovery.Resources = []*metav1.APIResourceList{{GroupVersion: "benchmark.io/v1", APIResources: apiResources}}
+	discovery.Resources = []*metav1.APIResourceList{
+		{GroupVersion: "v1", APIResources: []metav1.APIResource{{Name: "namespaces", Kind: "Namespace", Verbs: metav1.Verbs{"get", "list"}}}},
+		{GroupVersion: "benchmark.io/v1", APIResources: apiResources},
+	}
 	catalog := catalogdiscovery.NewCatalog(discovery, time.Hour, discardLogger())
 	if err := catalog.Refresh(); err != nil {
 		tb.Fatalf("refresh benchmark catalog: %v", err)
 	}
 
-	fixture := &scannerCycleBenchmarkFixture{store: store, metadata: metadataClient, now: started}
-	fixture.incidentLists = &incidentListCountingReader{Reader: store}
-	writer := &countingStatusClient{Client: store, writes: &fixture.statusWrites}
-	coordinator, err := NewCoordinator(fixture.incidentLists, writer, metadataClient, catalog, diagnosis.NewEngine(&benchmarkTargetReader{objects: targets}), Config{
+	reader := perftest.NewCountingReader(store, counters)
+	writer := perftest.NewCountingClient(store, counters)
+	coordinator, err := NewCoordinator(reader, writer, metadataClient, catalog, diagnosis.NewEngine(&benchmarkTargetReader{objects: targets, counters: counters}), Config{
 		Interval: time.Minute, Timeout: time.Minute, ResourceWorkers: 4, DiagnosisWorkers: 4,
-		PageSize: benchmarkPageSize, MaxTargets: benchmarkDeletingTargets * 2,
+		PageSize: int64(scale.PageSize), MaxTargets: deletingTargets(scale) * 2,
 	})
 	if err != nil {
 		tb.Fatal(err)
 	}
+	fixture := &scannerBenchmarkFixture{coordinator: coordinator, store: store, counters: counters, scale: scale, deletingTargets: deletingTargets(scale), now: now}
 	coordinator.now = func() time.Time { return fixture.now }
-	fixture.coordinator = coordinator
+	if prime {
+		if err := coordinator.RunCycle(context.Background()); err != nil {
+			tb.Fatalf("prime scanner cycle: %v", err)
+		}
+		fixture.verify(tb)
+	}
 	return fixture
+}
+
+func deletingTargets(scale perftest.Scale) int {
+	return scale.Resources * ((scale.Objects + 99) / 100)
+}
+
+func benchmarkTarget(gvr schema.GroupVersionResource, kind string, item metav1.PartialObjectMetadata) *unstructured.Unstructured {
+	metadata := map[string]any{
+		"name": item.Name, "uid": string(item.UID), "resourceVersion": item.ResourceVersion,
+		"deletionTimestamp": item.DeletionTimestamp.Format(time.RFC3339), "finalizers": []any{"benchmark.io/finalizer"},
+		"labels": map[string]any{"environment": "production", "role": "ordinary"},
+	}
+	if item.Namespace != "" {
+		metadata["namespace"] = item.Namespace
+	}
+	return &unstructured.Unstructured{Object: map[string]any{"apiVersion": gvr.GroupVersion().String(), "kind": kind, "metadata": metadata}}
 }
 
 func benchmarkPolicy(index int, resources []string) *safetyv1alpha1.TerminationPolicy {
 	selector := func(key, value string) *metav1.LabelSelector {
 		return &metav1.LabelSelector{MatchLabels: map[string]string{key: value}}
 	}
-	return &safetyv1alpha1.TerminationPolicy{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("policy-%02d", index), UID: types.UID(fmt.Sprintf("policy-uid-%02d", index)), Generation: 1}, Spec: safetyv1alpha1.TerminationPolicySpec{
-		Priority: int32(index),
-		TargetRules: []safetyv1alpha1.TargetRule{
-			{APIGroups: []string{"benchmark.io"}, Resources: resources, ObjectSelector: selector("role", "database"), NamespaceSelector: selector("team", "scanner")},
-			{APIGroups: []string{"benchmark.io"}, Resources: resources, ObjectSelector: selector("environment", "production"), NamespaceSelector: selector("team", "scanner"), ExcludedNamespaces: []string{"kube-system"}},
-			{APIGroups: []string{"benchmark.io"}, Resources: resources, ObjectSelector: selector("role", "ordinary"), NamespaceSelector: selector("team", "other")},
+	return &safetyv1alpha1.TerminationPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("policy-%02d", index), UID: types.UID(fmt.Sprintf("policy-uid-%02d", index)), ResourceVersion: perftest.ResourceVersion(index), Generation: 1},
+		Spec: safetyv1alpha1.TerminationPolicySpec{
+			Priority: int32(index),
+			TargetRules: []safetyv1alpha1.TargetRule{
+				{APIGroups: []string{"benchmark.io"}, Resources: resources, ObjectSelector: selector("role", "database"), NamespaceSelector: selector("team", "scanner")},
+				{APIGroups: []string{"benchmark.io"}, Resources: resources, ObjectSelector: selector("environment", "production"), NamespaceSelector: selector("team", "scanner"), ExcludedNamespaces: []string{"kube-system"}},
+				{APIGroups: []string{"benchmark.io"}, Resources: resources, ObjectSelector: selector("role", "ordinary"), NamespaceSelector: selector("team", "other")},
+			},
+			TerminationAge: metav1.Duration{Duration: time.Minute},
+			Diagnosis:      safetyv1alpha1.DiagnosisPolicy{MaxNamespaceObjects: 1000, MaxCRDInstances: 1000},
+			Remediation:    safetyv1alpha1.RemediationPolicy{MaxRisk: safetyv1alpha1.RiskHigh, AllowedFinalizers: []string{"benchmark.io/finalizer"}, ApprovalTTL: metav1.Duration{Duration: time.Hour}},
+			Retention:      safetyv1alpha1.RetentionPolicy{ResolvedIncidentTTL: metav1.Duration{Duration: time.Hour}},
 		},
-		TerminationAge: metav1.Duration{Duration: time.Minute},
-		Diagnosis:      safetyv1alpha1.DiagnosisPolicy{CheckAPIServices: true, CheckWebhooks: true, MaxNamespaceObjects: 1000, MaxCRDInstances: 1000},
-		Remediation:    safetyv1alpha1.RemediationPolicy{MaxRisk: safetyv1alpha1.RiskHigh, AllowedFinalizers: []string{"benchmark.io/finalizer"}, ApprovalTTL: metav1.Duration{Duration: time.Hour}},
-		Retention:      safetyv1alpha1.RetentionPolicy{ResolvedIncidentTTL: metav1.Duration{Duration: 365 * 24 * time.Hour}},
-	}}
+	}
 }
 
-func benchmarkActiveIncident(started time.Time, resource, kind, namespace, name string, uid types.UID, deletingAt metav1.Time) *safetyv1alpha1.DeletionIncident {
-	lastObserved := metav1.NewTime(started)
-	return &safetyv1alpha1.DeletionIncident{ObjectMeta: metav1.ObjectMeta{Name: incidentName(uid), Annotations: map[string]string{retentionAnnotation: (365 * 24 * time.Hour).String()}}, Spec: safetyv1alpha1.DeletionIncidentSpec{
-		Target: safetyv1alpha1.TargetReference{APIGroup: "benchmark.io", Version: "v1", Resource: resource, Kind: kind, Namespace: namespace, Name: name, UID: uid}, FirstObservedTime: metav1.NewTime(started.Add(-time.Hour)),
-	}, Status: safetyv1alpha1.DeletionIncidentStatus{Phase: safetyv1alpha1.IncidentPhaseActive, DeletionTimestamp: deletingAt.DeepCopy(), LastObservedTime: &lastObserved}}
+func benchmarkLifecycleIncident(now time.Time, phase safetyv1alpha1.IncidentPhase, resource, kind, namespace, name string, uid types.UID, deletingAt metav1.Time) *safetyv1alpha1.DeletionIncident {
+	return &safetyv1alpha1.DeletionIncident{
+		ObjectMeta: metav1.ObjectMeta{Name: incidentName(uid), UID: types.UID("incident-" + string(uid)), ResourceVersion: "21", Annotations: map[string]string{retentionAnnotation: time.Hour.String()}},
+		Spec:       safetyv1alpha1.DeletionIncidentSpec{Target: safetyv1alpha1.TargetReference{APIGroup: "benchmark.io", Version: "v1", Resource: resource, Kind: kind, Namespace: namespace, Name: name, UID: uid}, FirstObservedTime: metav1.NewTime(now.Add(-time.Hour))},
+		Status:     safetyv1alpha1.DeletionIncidentStatus{Phase: phase, DeletionTimestamp: deletingAt.DeepCopy()},
+	}
 }
 
-func benchmarkResolvedIncident(started time.Time, index int) *safetyv1alpha1.DeletionIncident {
-	resolved := metav1.NewTime(started)
-	uid := types.UID(fmt.Sprintf("resolved-%03d", index))
-	return &safetyv1alpha1.DeletionIncident{ObjectMeta: metav1.ObjectMeta{Name: incidentName(uid), Annotations: map[string]string{retentionAnnotation: (365 * 24 * time.Hour).String()}}, Spec: safetyv1alpha1.DeletionIncidentSpec{
-		Target: safetyv1alpha1.TargetReference{APIGroup: "benchmark.io", Version: "v1", Resource: "resources-00", Kind: "Resource00", Namespace: "ns-00", Name: fmt.Sprintf("resolved-%03d", index), UID: uid}, FirstObservedTime: metav1.NewTime(started.Add(-2 * time.Hour)),
-	}, Status: safetyv1alpha1.DeletionIncidentStatus{Phase: safetyv1alpha1.IncidentPhaseResolved, ResolvedTime: &resolved, ActivePolicyRef: &safetyv1alpha1.PolicyReference{Name: "policy-19", UID: "policy-uid-19", Generation: 1}}}
+func benchmarkStaleActiveIncident(now time.Time, resource string) *safetyv1alpha1.DeletionIncident {
+	deletingAt := metav1.NewTime(now.Add(-time.Hour))
+	return benchmarkLifecycleIncident(now, safetyv1alpha1.IncidentPhaseActive, resource, "Resource00", "ns-00", "absent", "stale-uid", deletingAt)
 }
 
-func (f *scannerCycleBenchmarkFixture) advance() { f.now = f.now.Add(time.Minute) }
-
-func (f *scannerCycleBenchmarkFixture) resetCounters() {
-	f.incidentLists.incidentLists.Store(0)
-	f.metadata.listCalls.Store(0)
-	f.statusWrites.Store(0)
-	f.mismatches.Store(0)
+func benchmarkResolvedIncident(now time.Time, suffix string, age time.Duration) *safetyv1alpha1.DeletionIncident {
+	resolved := metav1.NewTime(now.Add(age))
+	uid := types.UID("resolved-" + suffix)
+	return &safetyv1alpha1.DeletionIncident{
+		ObjectMeta: metav1.ObjectMeta{Name: incidentName(uid), UID: types.UID("incident-" + suffix), ResourceVersion: "22", Annotations: map[string]string{retentionAnnotation: time.Hour.String()}},
+		Spec:       safetyv1alpha1.DeletionIncidentSpec{Target: safetyv1alpha1.TargetReference{APIGroup: "benchmark.io", Version: "v1", Resource: "resources-00", Kind: "Resource00", Namespace: "ns-00", Name: suffix, UID: uid}, FirstObservedTime: metav1.NewTime(now.Add(-3 * time.Hour))},
+		Status:     safetyv1alpha1.DeletionIncidentStatus{Phase: safetyv1alpha1.IncidentPhaseResolved, ResolvedTime: &resolved},
+	}
 }
 
-func (f *scannerCycleBenchmarkFixture) verify(tb testing.TB) {
+func (f *scannerBenchmarkFixture) verify(tb testing.TB) {
 	tb.Helper()
 	var incidents safetyv1alpha1.DeletionIncidentList
 	if err := f.store.List(context.Background(), &incidents); err != nil {
-		f.mismatches.Add(1)
-		tb.Errorf("list benchmark incidents: %v", err)
+		f.fail(tb, "list benchmark incidents: %v", err)
 		return
 	}
-	active, resolved := 0, 0
-	policyReferenceMismatches := 0
-	statusPayloadMismatches := 0
+	active, failed, resolved := 0, 0, 0
 	for i := range incidents.Items {
 		incident := &incidents.Items[i]
-		policyRef := incident.Status.ActivePolicyRef
-		if policyRef == nil || policyRef.Name != "policy-19" || policyRef.UID != "policy-uid-19" || policyRef.Generation != 1 {
-			policyReferenceMismatches++
-		}
 		switch incident.Status.Phase {
 		case safetyv1alpha1.IncidentPhaseActive:
 			active++
-			finalizers := incident.Status.TargetSnapshot.MetadataFinalizers
-			if incident.Status.DeletionTimestamp == nil || incident.Status.LastObservedTime == nil ||
-				incident.Status.TargetSnapshot.ResourceVersion != "7" ||
-				len(finalizers) != 1 || finalizers[0] != "benchmark.io/finalizer" ||
-				len(incident.Status.Conditions) == 0 {
-				statusPayloadMismatches++
+			policyRef := incident.Status.ActivePolicyRef
+			if policyRef == nil || policyRef.Name != fmt.Sprintf("policy-%02d", f.scale.Policies-1) || incident.Status.TargetSnapshot.ResourceVersion != "7" || len(incident.Status.Conditions) == 0 {
+				f.fail(tb, "active incident %s has incomplete policy/status evidence", incident.Name)
 			}
+		case safetyv1alpha1.IncidentPhaseDiagnosisFailed:
+			failed++
 		case safetyv1alpha1.IncidentPhaseResolved:
 			resolved++
 			if incident.Status.ResolvedTime == nil {
-				statusPayloadMismatches++
+				f.fail(tb, "resolved incident %s has no resolution time", incident.Name)
 			}
-		case safetyv1alpha1.IncidentPhaseDiagnosisFailed:
-			statusPayloadMismatches++
 		default:
-			statusPayloadMismatches++
+			f.fail(tb, "incident %s has unexpected phase %q", incident.Name, incident.Status.Phase)
 		}
 	}
-	if policyReferenceMismatches != 0 {
-		f.mismatches.Add(int64(policyReferenceMismatches))
-		tb.Errorf("incidents with unexpected active policy reference = %d", policyReferenceMismatches)
+	if active != f.deletingTargets || failed != 0 || resolved != 2 {
+		f.fail(tb, "incident phases active/failed/resolved = %d/%d/%d, want %d/0/2", active, failed, resolved, f.deletingTargets)
 	}
-	if statusPayloadMismatches != 0 {
-		f.mismatches.Add(int64(statusPayloadMismatches))
-		tb.Errorf("incidents with unexpected status payload = %d", statusPayloadMismatches)
+	var policies safetyv1alpha1.TerminationPolicyList
+	if err := f.store.List(context.Background(), &policies); err != nil {
+		f.fail(tb, "list benchmark policies: %v", err)
+		return
 	}
-	if active != benchmarkDeletingTargets {
-		f.mismatches.Add(int64(abs(active - benchmarkDeletingTargets)))
-		tb.Errorf("active incidents = %d, want %d", active, benchmarkDeletingTargets)
-	}
-	if resolved != benchmarkDeletingTargets {
-		f.mismatches.Add(int64(abs(resolved - benchmarkDeletingTargets)))
-		tb.Errorf("resolved incidents = %d, want %d", resolved, benchmarkDeletingTargets)
+	for i := range policies.Items {
+		if policies.Items[i].Status.ObservedGeneration != policies.Items[i].Generation || len(policies.Items[i].Status.Conditions) == 0 {
+			f.fail(tb, "policy %s status was not reconciled", policies.Items[i].Name)
+		}
 	}
 }
 
-func abs(value int) int {
-	if value < 0 {
-		return -value
+func (f *scannerBenchmarkFixture) checkOperations(tb testing.TB, expected map[perftest.Operation]int64) {
+	tb.Helper()
+	if err := f.counters.Check(expected); err != nil {
+		tb.Fatal(err)
 	}
-	return value
+}
+
+func (f *scannerBenchmarkFixture) fail(tb testing.TB, format string, arguments ...any) {
+	f.counters.Record(perftest.Mismatch)
+	tb.Errorf(format, arguments...)
+}
+
+func (f *scannerBenchmarkFixture) report(b *testing.B, cycles int) {
+	perCycle := float64(cycles)
+	snapshot := f.counters.Snapshot()
+	b.ReportMetric(float64(f.scale.Resources*f.scale.Objects), "objects/cycle")
+	b.ReportMetric(float64(snapshot.Value(perftest.MetadataPage))/perCycle, "pages/cycle")
+	b.ReportMetric(float64(scannerAPIOperations(snapshot))/perCycle, "api_operations/cycle")
+	b.ReportMetric(float64(snapshot.Value(perftest.Write))/perCycle, "writes/cycle")
+	b.ReportMetric(float64(snapshot.Value(perftest.Retry))/perCycle, "retries/cycle")
+	b.ReportMetric(float64(snapshot.Value(perftest.StatusWrite))/perCycle, "status_writes/cycle")
+	b.ReportMetric(float64(snapshot.Value(perftest.Delete))/perCycle, "deletes/cycle")
+	b.ReportMetric(float64(snapshot.Value(perftest.Mismatch))/perCycle, "mismatches/cycle")
+}
+
+func steadyScannerOperations(scale perftest.Scale, cycles int64) map[perftest.Operation]int64 {
+	pages := int64(scale.Resources*((scale.Objects+scale.PageSize-1)/scale.PageSize) + (min(scale.Objects, 10)+scale.PageSize-1)/scale.PageSize)
+	return map[perftest.Operation]int64{
+		perftest.MetadataList: pages * cycles, perftest.MetadataPage: pages * cycles,
+		perftest.PolicyList: cycles, perftest.IncidentList: cycles, perftest.TypedList: 3 * cycles,
+		perftest.DynamicGet: int64(deletingTargets(scale)) * cycles,
+	}
+}
+
+func lifecycleScannerOperations(scale perftest.Scale, cycles int64) map[perftest.Operation]int64 {
+	operations := steadyScannerOperations(scale, cycles)
+	missing := int64((deletingTargets(scale) + 2) / 3)
+	statusWrites := int64(scale.Policies+deletingTargets(scale)+1) * cycles
+	operations[perftest.IncidentList] = 2 * cycles
+	operations[perftest.TypedGet] = (2*missing + 1) * cycles
+	operations[perftest.Create] = missing * cycles
+	operations[perftest.StatusWrite] = statusWrites
+	operations[perftest.Delete] = cycles
+	operations[perftest.Write] = statusWrites + missing*cycles + cycles
+	return operations
+}
+
+func scannerAPIOperations(snapshot perftest.Snapshot) int64 {
+	return snapshot.Value(perftest.MetadataList) + snapshot.Value(perftest.TypedGet) + snapshot.Value(perftest.DynamicGet) +
+		snapshot.Value(perftest.TypedList) + snapshot.Value(perftest.DynamicList) + snapshot.Value(perftest.IncidentList) +
+		snapshot.Value(perftest.PolicyList) + snapshot.Value(perftest.Create) + snapshot.Value(perftest.Update) +
+		snapshot.Value(perftest.Patch) + snapshot.Value(perftest.StatusWrite) + snapshot.Value(perftest.Delete)
 }
 
 type benchmarkMetadataClient struct {
-	objects   map[schema.GroupVersionResource][]metav1.PartialObjectMetadata
-	pageSize  int64
-	listCalls atomic.Int64
+	objects  map[schema.GroupVersionResource][]metav1.PartialObjectMetadata
+	pageSize int64
+	counters *perftest.Counters
 }
 
 func (c *benchmarkMetadataClient) Resource(resource schema.GroupVersionResource) metadata.Getter {
@@ -311,7 +406,8 @@ func (r *benchmarkMetadataResource) Namespace(namespace string) metadata.Resourc
 }
 
 func (r *benchmarkMetadataResource) List(_ context.Context, options metav1.ListOptions) (*metav1.PartialObjectMetadataList, error) {
-	r.client.listCalls.Add(1)
+	r.client.counters.Record(perftest.MetadataList)
+	r.client.counters.Record(perftest.MetadataPage)
 	items, found := r.client.objects[r.resource]
 	if !found {
 		return nil, fmt.Errorf("benchmark resource %s not found", r.resource)
@@ -356,10 +452,12 @@ func (*benchmarkMetadataResource) Patch(context.Context, string, types.PatchType
 }
 
 type benchmarkTargetReader struct {
-	objects map[string]*unstructured.Unstructured
+	objects  map[string]*unstructured.Unstructured
+	counters *perftest.Counters
 }
 
 func (r *benchmarkTargetReader) Get(_ context.Context, resource schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	r.counters.Record(perftest.DynamicGet)
 	object, found := r.objects[benchmarkTargetKey(resource, namespace, name)]
 	if !found {
 		return nil, fmt.Errorf("benchmark target %s/%s not found", namespace, name)
@@ -373,35 +471,4 @@ func (*benchmarkTargetReader) ListMetadata(context.Context, schema.GroupVersionR
 
 func benchmarkTargetKey(resource schema.GroupVersionResource, namespace, name string) string {
 	return resource.String() + "/" + namespace + "/" + name
-}
-
-type countingStatusClient struct {
-	client.Client
-	writes *atomic.Int64
-}
-
-func (c *countingStatusClient) Status() client.SubResourceWriter {
-	return &countingStatusWriter{SubResourceWriter: c.Client.Status(), writes: c.writes}
-}
-
-type countingStatusWriter struct {
-	client.SubResourceWriter
-	writes *atomic.Int64
-}
-
-func (w *countingStatusWriter) Create(ctx context.Context, object client.Object, subResource client.Object, options ...client.SubResourceCreateOption) error {
-	w.writes.Add(1)
-	return w.SubResourceWriter.Create(ctx, object, subResource, options...)
-}
-func (w *countingStatusWriter) Update(ctx context.Context, object client.Object, options ...client.SubResourceUpdateOption) error {
-	w.writes.Add(1)
-	return w.SubResourceWriter.Update(ctx, object, options...)
-}
-func (w *countingStatusWriter) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.SubResourcePatchOption) error {
-	w.writes.Add(1)
-	return w.SubResourceWriter.Patch(ctx, object, patch, options...)
-}
-func (w *countingStatusWriter) Apply(ctx context.Context, object runtime.ApplyConfiguration, options ...client.SubResourceApplyOption) error {
-	w.writes.Add(1)
-	return w.SubResourceWriter.Apply(ctx, object, options...)
 }
