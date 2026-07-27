@@ -271,7 +271,7 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 	}
 
 	t.Run("conflict fetches current incident before retry", func(t *testing.T) {
-		coordinator, store, observed, result, stale, mutated := setup(t)
+		coordinator, store, observed, result, stale, metricsDirty := setup(t)
 		ctx := context.Background()
 		hookClient := &statusUpdateHookClient{Client: store}
 		hookClient.beforeFirstUpdate = func(client.Object) error {
@@ -287,7 +287,7 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 		}
 		coordinator.writer = hookClient
 
-		if err := coordinator.persistDiagnosis(ctx, observed, result, &stale, mutated, time.Now().UTC()); err != nil {
+		if err := coordinator.persistDiagnosis(ctx, observed, result, &stale, metricsDirty, time.Now().UTC()); err != nil {
 			t.Fatalf("persist diagnosis after conflict: %v", err)
 		}
 		var updated safetyv1alpha1.DeletionIncident
@@ -297,8 +297,8 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 		if updated.Status.ActivePolicyRef == nil || updated.Status.ActivePolicyRef.UID != "policy-uid" || updated.Status.ResolutionReason != "" || updated.Status.TargetSnapshot.ResourceVersion != "8" {
 			t.Fatalf("unexpected status after retry: %#v", updated.Status)
 		}
-		if !mutated.Load() {
-			t.Fatal("persisted status was not reported as mutated")
+		if metricsDirty.Load() {
+			t.Fatal("same-phase status update unnecessarily invalidated incident phase metrics")
 		}
 		if attempts := hookClient.statusUpdateAttempts.Load(); attempts != 2 {
 			t.Fatalf("status update attempts = %d, want 2", attempts)
@@ -306,7 +306,7 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 	})
 
 	t.Run("deletion during conflict retry is returned without recreation", func(t *testing.T) {
-		coordinator, store, observed, result, stale, mutated := setup(t)
+		coordinator, store, observed, result, stale, metricsDirty := setup(t)
 		ctx := context.Background()
 		hookClient := &statusUpdateHookClient{Client: store}
 		hookClient.beforeFirstUpdate = func(client.Object) error {
@@ -317,7 +317,7 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 		}
 		coordinator.writer = hookClient
 
-		err := coordinator.persistDiagnosis(ctx, observed, result, &stale, mutated, time.Now().UTC())
+		err := coordinator.persistDiagnosis(ctx, observed, result, &stale, metricsDirty, time.Now().UTC())
 		if !apierrors.IsNotFound(err) {
 			t.Fatalf("persist after deletion error = %v, want NotFound", err)
 		}
@@ -326,6 +326,36 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 			t.Fatalf("deleted incident was recreated: %v", err)
 		}
 	})
+}
+
+func TestRunCycleDoesNotRelistIncidentsForSamePhaseStatusRefresh(t *testing.T) {
+	coordinator, _, store, now := testCoordinator(t)
+	ctx := context.Background()
+	if err := coordinator.RunCycle(ctx); err != nil {
+		t.Fatalf("initial cycle: %v", err)
+	}
+	var before safetyv1alpha1.DeletionIncident
+	if err := store.Get(ctx, client.ObjectKey{Name: "deletion-target-uid"}, &before); err != nil {
+		t.Fatal(err)
+	}
+
+	counter := &incidentListCountingReader{Reader: coordinator.reader}
+	coordinator.reader = counter
+	*now = now.Add(observationRefresh)
+	if err := coordinator.RunCycle(ctx); err != nil {
+		t.Fatalf("refresh cycle: %v", err)
+	}
+
+	var after safetyv1alpha1.DeletionIncident
+	if err := store.Get(ctx, client.ObjectKey{Name: before.Name}, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Status.LastObservedTime == nil || before.Status.LastObservedTime == nil || !after.Status.LastObservedTime.After(before.Status.LastObservedTime.Time) {
+		t.Fatalf("last observed time did not advance: before=%v after=%v", before.Status.LastObservedTime, after.Status.LastObservedTime)
+	}
+	if got := counter.incidentLists.Load(); got != 1 {
+		t.Fatalf("incident list calls = %d, want one scan-scope list and no metrics relist", got)
+	}
 }
 
 func TestCompilePoliciesCacheMatchesFreshCompilationAndInvalidatesOnCatalogChange(t *testing.T) {
@@ -479,6 +509,8 @@ func TestDiagnosisErrorClearsStaleRemediationActions(t *testing.T) {
 		t.Fatal("initial diagnosis did not publish a remediation action")
 	}
 
+	counter := &incidentListCountingReader{Reader: coordinator.reader}
+	coordinator.reader = counter
 	coordinator.engine = diagnosis.NewEngine(failingDiagnosisReader{})
 	*now = now.Add(time.Minute)
 	if err := coordinator.RunCycle(ctx); err == nil {
@@ -489,6 +521,9 @@ func TestDiagnosisErrorClearsStaleRemediationActions(t *testing.T) {
 	}
 	if incident.Status.Phase != safetyv1alpha1.IncidentPhaseDiagnosisFailed || len(incident.Status.RecommendedActions) != 0 {
 		t.Fatalf("stale remediation remained actionable after diagnosis failure: %#v", incident.Status)
+	}
+	if got := counter.incidentLists.Load(); got != 2 {
+		t.Fatalf("incident list calls = %d, want scan-scope and post-phase-change metric lists", got)
 	}
 }
 
@@ -747,6 +782,18 @@ func fakeMetadataList(continueToken string, items ...metav1.PartialObjectMetadat
 		list.Items[i] = runtime.RawExtension{Object: &item}
 	}
 	return list
+}
+
+type incidentListCountingReader struct {
+	client.Reader
+	incidentLists atomic.Int64
+}
+
+func (r *incidentListCountingReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if _, ok := list.(*safetyv1alpha1.DeletionIncidentList); ok {
+		r.incidentLists.Add(1)
+	}
+	return r.Reader.List(ctx, list, options...)
 }
 
 type snapshotFailingReader struct {

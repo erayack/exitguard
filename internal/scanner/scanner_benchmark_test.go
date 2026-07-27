@@ -76,6 +76,7 @@ func BenchmarkScannerCycleFixedScale(b *testing.B) {
 	fixture.verify(b)
 	cycles := float64(b.N)
 	b.ReportMetric(float64(benchmarkResourceCount*benchmarkObjectsPerType), "objects/cycle")
+	b.ReportMetric(float64(fixture.incidentLists.incidentLists.Load())/cycles, "incident_list_calls/cycle")
 	b.ReportMetric(float64(fixture.metadata.listCalls.Load())/cycles, "metadata_list_calls/cycle")
 	b.ReportMetric(float64(fixture.statusWrites.Load())/cycles, "status_writes/cycle")
 	b.ReportMetric(float64(benchmarkDeletingTargets), "fixture_deleting_targets/cycle")
@@ -83,12 +84,13 @@ func BenchmarkScannerCycleFixedScale(b *testing.B) {
 }
 
 type scannerCycleBenchmarkFixture struct {
-	coordinator  *Coordinator
-	store        client.Client
-	metadata     *benchmarkMetadataClient
-	statusWrites atomic.Int64
-	mismatches   atomic.Int64
-	now          time.Time
+	coordinator   *Coordinator
+	store         client.Client
+	metadata      *benchmarkMetadataClient
+	incidentLists *incidentListCountingReader
+	statusWrites  atomic.Int64
+	mismatches    atomic.Int64
+	now           time.Time
 }
 
 func newScannerCycleBenchmarkFixture(tb testing.TB) *scannerCycleBenchmarkFixture {
@@ -167,8 +169,9 @@ func newScannerCycleBenchmarkFixture(tb testing.TB) *scannerCycleBenchmarkFixtur
 	}
 
 	fixture := &scannerCycleBenchmarkFixture{store: store, metadata: metadataClient, now: started}
+	fixture.incidentLists = &incidentListCountingReader{Reader: store}
 	writer := &countingStatusClient{Client: store, writes: &fixture.statusWrites}
-	coordinator, err := NewCoordinator(store, writer, metadataClient, catalog, diagnosis.NewEngine(&benchmarkTargetReader{objects: targets}), Config{
+	coordinator, err := NewCoordinator(fixture.incidentLists, writer, metadataClient, catalog, diagnosis.NewEngine(&benchmarkTargetReader{objects: targets}), Config{
 		Interval: time.Minute, Timeout: time.Minute, ResourceWorkers: 4, DiagnosisWorkers: 4,
 		PageSize: benchmarkPageSize, MaxTargets: benchmarkDeletingTargets * 2,
 	})
@@ -216,6 +219,7 @@ func benchmarkResolvedIncident(started time.Time, index int) *safetyv1alpha1.Del
 func (f *scannerCycleBenchmarkFixture) advance() { f.now = f.now.Add(time.Minute) }
 
 func (f *scannerCycleBenchmarkFixture) resetCounters() {
+	f.incidentLists.incidentLists.Store(0)
 	f.metadata.listCalls.Store(0)
 	f.statusWrites.Store(0)
 	f.mismatches.Store(0)
@@ -253,6 +257,8 @@ func (f *scannerCycleBenchmarkFixture) verify(tb testing.TB) {
 			if incident.Status.ResolvedTime == nil {
 				statusPayloadMismatches++
 			}
+		case safetyv1alpha1.IncidentPhaseDiagnosisFailed:
+			statusPayloadMismatches++
 		default:
 			statusPayloadMismatches++
 		}
@@ -299,9 +305,9 @@ type benchmarkMetadataResource struct {
 }
 
 func (r *benchmarkMetadataResource) Namespace(namespace string) metadata.ResourceInterface {
-	copy := *r
-	copy.namespace = namespace
-	return &copy
+	resourceCopy := *r
+	resourceCopy.namespace = namespace
+	return &resourceCopy
 }
 
 func (r *benchmarkMetadataResource) List(_ context.Context, options metav1.ListOptions) (*metav1.PartialObjectMetadataList, error) {

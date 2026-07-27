@@ -162,18 +162,20 @@ func (c *Coordinator) RunCycle(ctx context.Context) error {
 			return errors.Join(err, namespaceErr, c.failActiveIncidentDiagnoses(ctx, now, "SnapshotFailed", "diagnosis snapshot is incomplete"))
 		}
 	}
-	diagnosisMutated, diagnoseErr := c.diagnoseTargets(ctx, observations, snapshot, incidents, now)
+	diagnosisMetricsDirty, diagnoseErr := c.diagnoseTargets(ctx, observations, snapshot, incidents, now)
 	if diagnoseErr != nil {
 		err = errors.Join(err, diagnoseErr)
 		if ctx.Err() != nil {
 			return errors.Join(err, c.failActiveIncidentDiagnoses(ctx, now, "ScanTimedOut", "the current scan did not complete"))
 		}
 	}
-	lifecycleMutated, lifecycleErr := c.reconcileLifecycle(ctx, observations, coverage, catalog, policies, incidents, now)
+	lifecycleMetricsDirty, lifecycleErr := c.reconcileLifecycle(ctx, observations, coverage, catalog, policies, incidents, now)
 	if lifecycleErr != nil {
 		err = errors.Join(err, lifecycleErr)
 	}
-	if diagnosisMutated || lifecycleMutated {
+	// Incident metrics depend only on collection membership and phase. Keep the
+	// scan-scope list when diagnosis changed other status fields only.
+	if diagnosisMetricsDirty || lifecycleMetricsDirty {
 		incidents = nil
 	}
 	c.updateIncidentMetrics(ctx, incidents)
@@ -618,7 +620,9 @@ func (c *Coordinator) diagnoseTargets(ctx context.Context, observations map[type
 	}
 	jobs := make(chan observation)
 	errs := make(chan error, len(observations))
-	var mutated atomic.Bool
+	// Status refreshes are frequent, but only creates and phase transitions can
+	// make the incident list stale for the phase gauges.
+	var metricsDirty atomic.Bool
 	var workers sync.WaitGroup
 	for range c.config.DiagnosisWorkers {
 		workers.Add(1)
@@ -630,7 +634,7 @@ func (c *Coordinator) diagnoseTargets(ctx context.Context, observations map[type
 					thresholdElapsed := observed.meta.DeletionTimestamp != nil && !now.Before(observed.meta.DeletionTimestamp.Add(observed.policy.Settings().TerminationAge))
 					result = diagnosis.Result{TargetFound: true, UIDMatches: true, ThresholdElapsed: thresholdElapsed}
 				}
-				persistErr := c.persistDiagnosis(ctx, observed, result, knownIncidents[observed.target.UID], &mutated, now)
+				persistErr := c.persistDiagnosis(ctx, observed, result, knownIncidents[observed.target.UID], &metricsDirty, now)
 				err := errors.Join(diagnoseErr, persistErr)
 				if err != nil {
 					diagnoses.WithLabelValues("error").Inc()
@@ -657,15 +661,19 @@ func (c *Coordinator) diagnoseTargets(ctx context.Context, observations map[type
 	for err := range errs {
 		collected = append(collected, err)
 	}
-	return mutated.Load(), errors.Join(collected...)
+	return metricsDirty.Load(), errors.Join(collected...)
 }
 
-func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation, result diagnosis.Result, existing *safetyv1alpha1.DeletionIncident, mutated *atomic.Bool, now time.Time) error {
+func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation, result diagnosis.Result, existing *safetyv1alpha1.DeletionIncident, metricsDirty *atomic.Bool, now time.Time) error {
 	name := incidentName(observed.target.UID)
 	var err error
 	if existing == nil {
 		existing = &safetyv1alpha1.DeletionIncident{}
 		err = c.reader.Get(ctx, client.ObjectKey{Name: name}, existing)
+		if err == nil {
+			// A concurrent create was absent from the scan-scope list.
+			metricsDirty.Store(true)
+		}
 	}
 	switch {
 	case apierrors.IsNotFound(err):
@@ -676,16 +684,16 @@ func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation
 		if err := c.writer.Create(ctx, incident); err != nil && !apierrors.IsAlreadyExists(err) {
 			return err
 		}
-		mutated.Store(true)
+		metricsDirty.Store(true)
 	case err != nil:
 		return err
 	case existing.Spec.Target.UID != observed.target.UID:
 		return fmt.Errorf("incident %s belongs to different target UID", name)
 	case !result.TargetFound:
-		mutated.Store(true)
+		metricsDirty.Store(true)
 		return c.resolveIncident(ctx, name, "TargetAbsent", now)
 	case !result.UIDMatches:
-		mutated.Store(true)
+		metricsDirty.Store(true)
 		return c.resolveIncident(ctx, name, "TargetReplaced", now)
 	}
 	var current *safetyv1alpha1.DeletionIncident
@@ -710,7 +718,6 @@ func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation
 				current = nil
 				return err
 			}
-			mutated.Store(true)
 		}
 		desired := current.Status.DeepCopy()
 		desired.ActivePolicyRef = &safetyv1alpha1.PolicyReference{Name: observed.policy.Name(), UID: observed.policy.UID(), Generation: observed.policy.Generation()}
@@ -746,13 +753,16 @@ func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation
 		if apiequality.Semantic.DeepEqual(current.Status, *desired) {
 			return nil
 		}
+		if current.Status.Phase != desired.Phase {
+			metricsDirty.Store(true)
+		}
 		current.Status = *desired
-		mutated.Store(true)
 		err := c.writer.Status().Update(ctx, current)
 		current = nil
 		return err
 	})
 	if apierrors.IsRequestEntityTooLargeError(err) {
+		metricsDirty.Store(true)
 		fallbackErr := c.failIncidentDiagnosis(ctx, name, now, "EvidenceTooLarge", "diagnostic evidence exceeded the Kubernetes object size limit")
 		return errors.Join(err, fallbackErr)
 	}
