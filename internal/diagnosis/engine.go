@@ -25,7 +25,6 @@ import (
 	"slices"
 	"sort"
 	"strconv"
-	"strings"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -303,8 +302,15 @@ func actionID(actionType safetyv1alpha1.RemediationActionType, uid types.UID, fi
 }
 
 func digest(parts ...string) string {
-	hash := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
-	return hex.EncodeToString(hash[:])
+	hasher := sha256.New()
+	for i, part := range parts {
+		if i > 0 {
+			_, _ = hasher.Write([]byte{0})
+		}
+		_, _ = hasher.Write([]byte(part))
+	}
+	var sum [sha256.Size]byte
+	return hex.EncodeToString(hasher.Sum(sum[:0]))
 }
 
 func targetReference(base safetyv1alpha1.TargetReference, object metav1.Object) *safetyv1alpha1.TargetReference {

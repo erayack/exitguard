@@ -154,6 +154,26 @@ func TestGenericDiagnosisProducesDeterministicEvidence(t *testing.T) {
 	}
 }
 
+func TestDigestPreservesStableFraming(t *testing.T) {
+	tests := []struct {
+		name  string
+		parts []string
+		want  string
+	}{
+		{name: "no parts", want: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		{name: "one part", parts: []string{"alpha"}, want: "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8"},
+		{name: "empty middle part", parts: []string{"alpha", "", "omega"}, want: "eca58a0214e81f78317c139666265022f1fd20c1a97ef78a567317af9bee7669"},
+		{name: "two empty parts", parts: []string{"", ""}, want: "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := digest(test.parts...); got != test.want {
+				t.Fatalf("digest(%q) = %q, want %q", test.parts, got, test.want)
+			}
+		})
+	}
+}
+
 func TestActionIDBindsTargetAndPolicyEvidence(t *testing.T) {
 	base := actionID(safetyv1alpha1.ActionRemoveResourceFinalizer, types.UID("target-uid"), "example.io/cleanup", "7", types.UID("policy-uid"), 3)
 	identical := actionID(safetyv1alpha1.ActionRemoveResourceFinalizer, types.UID("target-uid"), "example.io/cleanup", "7", types.UID("policy-uid"), 3)
