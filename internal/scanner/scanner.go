@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -29,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -69,14 +71,16 @@ type Catalog interface {
 
 // Coordinator serializes scan cycles. It is registered as a leader-elected manager runnable.
 type Coordinator struct {
-	reader   client.Reader
-	writer   client.Client
-	metadata metadata.Interface
-	catalog  Catalog
-	engine   *diagnosis.Engine
-	config   Config
-	now      func() time.Time
-	cycleMu  sync.Mutex
+	reader             client.Reader
+	writer             client.Client
+	metadata           metadata.Interface
+	catalog            Catalog
+	engine             *diagnosis.Engine
+	config             Config
+	now                func() time.Time
+	cycleMu            sync.Mutex
+	policyCatalog      []catalogdiscovery.Resource
+	policyCompileCache map[policyCompileCacheKey]policyCompileCacheEntry
 }
 
 // NewCoordinator creates a scanner. reader should be the manager API reader so conflict retries are fresh.
@@ -147,7 +151,7 @@ func (c *Coordinator) RunCycle(ctx context.Context) error {
 	if namespaceErr != nil {
 		return errors.Join(namespaceErr, c.failActiveIncidentDiagnoses(ctx, now, "NamespaceInventoryFailed", "namespace label inventory is incomplete"))
 	}
-	observations, coverage, err := c.listTargets(ctx, catalog, policies, namespaceLabels)
+	observations, coverage, incidents, err := c.listTargets(ctx, catalog, policies, namespaceLabels)
 	if err != nil && ctx.Err() != nil {
 		return errors.Join(err, c.failActiveIncidentDiagnoses(ctx, now, "ScanTimedOut", "the current scan did not complete"))
 	}
@@ -158,17 +162,34 @@ func (c *Coordinator) RunCycle(ctx context.Context) error {
 			return errors.Join(err, namespaceErr, c.failActiveIncidentDiagnoses(ctx, now, "SnapshotFailed", "diagnosis snapshot is incomplete"))
 		}
 	}
-	if diagnoseErr := c.diagnoseTargets(ctx, observations, snapshot, now); diagnoseErr != nil {
+	diagnosisMutated, diagnoseErr := c.diagnoseTargets(ctx, observations, snapshot, incidents, now)
+	if diagnoseErr != nil {
 		err = errors.Join(err, diagnoseErr)
 		if ctx.Err() != nil {
 			return errors.Join(err, c.failActiveIncidentDiagnoses(ctx, now, "ScanTimedOut", "the current scan did not complete"))
 		}
 	}
-	if lifecycleErr := c.reconcileLifecycle(ctx, observations, coverage, catalog, policies, now); lifecycleErr != nil {
+	lifecycleMutated, lifecycleErr := c.reconcileLifecycle(ctx, observations, coverage, catalog, policies, incidents, now)
+	if lifecycleErr != nil {
 		err = errors.Join(err, lifecycleErr)
 	}
-	c.updateIncidentMetrics(ctx)
+	if diagnosisMutated || lifecycleMutated {
+		incidents = nil
+	}
+	c.updateIncidentMetrics(ctx, incidents)
 	return err
+}
+
+type policyCompileCacheKey struct {
+	uid  types.UID
+	name string
+}
+
+type policyCompileCacheEntry struct {
+	generation int64
+	spec       safetyv1alpha1.TerminationPolicySpec
+	compiled   *policyengine.CompiledPolicy
+	status     safetyv1alpha1.TerminationPolicyStatus
 }
 
 type compiledPolicies struct {
@@ -176,17 +197,47 @@ type compiledPolicies struct {
 	byUID map[types.UID]*policyengine.CompiledPolicy
 }
 
+func (p compiledPolicies) selectWinning(target policyengine.Target) *policyengine.CompiledPolicy {
+	for _, candidate := range p.items {
+		if candidate.Match(target) {
+			return candidate
+		}
+	}
+	return nil
+}
+
 func (c *Coordinator) compilePolicies(ctx context.Context, catalog catalogdiscovery.Snapshot, now time.Time) (compiledPolicies, error) {
 	var list safetyv1alpha1.TerminationPolicyList
 	if err := c.reader.List(ctx, &list); err != nil {
 		return compiledPolicies{}, fmt.Errorf("list termination policies: %w", err)
 	}
+	catalogResources := catalog.Resources()
+	cache := c.policyCompileCache
+	if !reflect.DeepEqual(c.policyCatalog, catalogResources) {
+		cache = nil
+	}
+	nextCache := make(map[policyCompileCacheKey]policyCompileCacheEntry, len(list.Items))
 	result := compiledPolicies{byUID: make(map[types.UID]*policyengine.CompiledPolicy, len(list.Items))}
 	readyCount := 0
 	for i := range list.Items {
 		policy := &list.Items[i]
-		compiled, status := policyengine.Compile(policy, catalog, now)
-		if err := c.updatePolicyStatus(ctx, policy.Name, status); err != nil {
+		key := policyCompileCacheKey{uid: policy.UID, name: policy.Name}
+		entry, cached := cache[key]
+		if !cached || entry.generation != policy.Generation || !reflect.DeepEqual(entry.spec, policy.Spec) {
+			compiled, status := policyengine.Compile(policy, catalog, now)
+			entry = policyCompileCacheEntry{generation: policy.Generation, spec: policy.Spec, compiled: compiled, status: status}
+		} else {
+			validated := metav1.NewTime(now)
+			status := entry.status.DeepCopy()
+			status.LastValidatedTime = &validated
+			for j := range status.Conditions {
+				status.Conditions[j].LastTransitionTime = validated
+			}
+			entry.status = *status
+		}
+		compiled, status := entry.compiled, *entry.status.DeepCopy()
+		nextCache[key] = entry
+		if err := c.updatePolicyStatus(ctx, policy, status); err != nil {
 			return compiledPolicies{}, err
 		}
 		result.byUID[compiled.UID()] = compiled
@@ -195,23 +246,36 @@ func (c *Coordinator) compilePolicies(ctx context.Context, catalog catalogdiscov
 			readyCount++
 		}
 	}
+	sort.Slice(result.items, func(i, j int) bool {
+		if result.items[i].Priority() != result.items[j].Priority() {
+			return result.items[i].Priority() > result.items[j].Priority()
+		}
+		return result.items[i].Name() < result.items[j].Name()
+	})
 	compiledPoliciesGauge.WithLabelValues("true").Set(float64(readyCount))
 	compiledPoliciesGauge.WithLabelValues("false").Set(float64(len(list.Items) - readyCount))
+	c.policyCatalog = catalogResources
+	c.policyCompileCache = nextCache
 	return result, nil
 }
 
-func (c *Coordinator) updatePolicyStatus(ctx context.Context, name string, desired safetyv1alpha1.TerminationPolicyStatus) error {
+func (c *Coordinator) updatePolicyStatus(ctx context.Context, current *safetyv1alpha1.TerminationPolicy, desired safetyv1alpha1.TerminationPolicyStatus) error {
+	name := current.Name
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		var current safetyv1alpha1.TerminationPolicy
-		if err := c.reader.Get(ctx, client.ObjectKey{Name: name}, &current); err != nil {
-			return err
+		if current == nil {
+			current = &safetyv1alpha1.TerminationPolicy{}
+			if err := c.reader.Get(ctx, client.ObjectKey{Name: name}, current); err != nil {
+				return err
+			}
 		}
 		desired.Conditions = preserveConditionTransitions(current.Status.Conditions, desired.Conditions)
-		if reflect.DeepEqual(current.Status, desired) {
+		if apiequality.Semantic.DeepEqual(current.Status, desired) {
 			return nil
 		}
 		current.Status = desired
-		return c.writer.Status().Update(ctx, &current)
+		err := c.writer.Status().Update(ctx, current)
+		current = nil
+		return err
 	})
 }
 
@@ -366,7 +430,7 @@ func (b *targetBudget) reserve(uid types.UID) bool {
 	return true
 }
 
-func (c *Coordinator) resourcesToScan(ctx context.Context, catalog catalogdiscovery.Snapshot, policies compiledPolicies) ([]catalogdiscovery.Resource, map[schema.GroupResource]trackedTargets, error) {
+func (c *Coordinator) resourcesToScan(ctx context.Context, catalog catalogdiscovery.Snapshot, policies compiledPolicies) ([]catalogdiscovery.Resource, map[schema.GroupResource]trackedTargets, *safetyv1alpha1.DeletionIncidentList, error) {
 	selected := make(map[schema.GroupResource]catalogdiscovery.Resource)
 	for _, policy := range policies.items {
 		for _, groupResource := range policy.ResolvedGroupResources() {
@@ -377,7 +441,7 @@ func (c *Coordinator) resourcesToScan(ctx context.Context, catalog catalogdiscov
 	}
 	var incidents safetyv1alpha1.DeletionIncidentList
 	if err := c.reader.List(ctx, &incidents); err != nil {
-		return nil, nil, fmt.Errorf("list incidents for scan scope: %w", err)
+		return nil, nil, nil, fmt.Errorf("list incidents for scan scope: %w", err)
 	}
 	tracked := make(map[schema.GroupResource]trackedTargets)
 	for i := range incidents.Items {
@@ -407,13 +471,13 @@ func (c *Coordinator) resourcesToScan(ctx context.Context, catalog catalogdiscov
 		resources = append(resources, resource)
 	}
 	sort.Slice(resources, func(i, j int) bool { return resources[i].GroupResource.String() < resources[j].GroupResource.String() })
-	return resources, tracked, nil
+	return resources, tracked, &incidents, nil
 }
 
-func (c *Coordinator) listTargets(ctx context.Context, catalog catalogdiscovery.Snapshot, policies compiledPolicies, namespaceLabels map[string]map[string]string) (map[types.UID]observation, map[schema.GroupResource]resourceCoverage, error) {
-	resources, tracked, err := c.resourcesToScan(ctx, catalog, policies)
+func (c *Coordinator) listTargets(ctx context.Context, catalog catalogdiscovery.Snapshot, policies compiledPolicies, namespaceLabels map[string]map[string]string) (map[types.UID]observation, map[schema.GroupResource]resourceCoverage, *safetyv1alpha1.DeletionIncidentList, error) {
+	resources, tracked, incidents, err := c.resourcesToScan(ctx, catalog, policies)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	budget := &targetBudget{maximum: c.config.MaxTargets, reserved: make(map[types.UID]struct{})}
 	jobs := make(chan catalogdiscovery.Resource)
@@ -469,7 +533,7 @@ func (c *Coordinator) listTargets(ctx context.Context, catalog catalogdiscovery.
 			state.allUIDs[item.UID] = struct{}{}
 			state.identities[objectIdentity(item.Namespace, item.Name)] = item.UID
 			target := policyengine.Target{GroupResource: listed.resource.GroupResource, Namespaced: listed.resource.PreferredVersion.Namespaced, Namespace: item.Namespace, Labels: item.Labels, NamespaceLabels: namespaceLabels[item.Namespace]}
-			winner := policyengine.SelectWinning(policies.items, target)
+			winner := policies.selectWinning(target)
 			if winner == nil {
 				continue
 			}
@@ -480,7 +544,7 @@ func (c *Coordinator) listTargets(ctx context.Context, catalog catalogdiscovery.
 			if _, exists := observations[item.UID]; exists {
 				continue
 			}
-			observations[item.UID] = observation{policy: winner, meta: *item.DeepCopy(), target: safetyv1alpha1.TargetReference{
+			observations[item.UID] = observation{policy: winner, meta: *item, target: safetyv1alpha1.TargetReference{
 				APIGroup: listed.resource.GroupResource.Group, Version: listed.resource.PreferredVersion.Version,
 				Resource: listed.resource.GroupResource.Resource, Kind: listed.resource.PreferredVersion.Kind,
 				Namespace: item.Namespace, Name: item.Name, UID: item.UID,
@@ -495,7 +559,7 @@ func (c *Coordinator) listTargets(ctx context.Context, catalog catalogdiscovery.
 		}
 		errs = append(errs, fmt.Errorf("scan target bound %d exceeded", c.config.MaxTargets))
 	}
-	return observations, coverage, errors.Join(errs...)
+	return observations, coverage, incidents, errors.Join(errs...)
 }
 
 func (c *Coordinator) listResource(ctx context.Context, resource catalogdiscovery.Resource, policies compiledPolicies, namespaceLabels map[string]map[string]string, tracked trackedTargets, budget *targetBudget) ([]metav1.PartialObjectMetadata, catalogdiscovery.Version, error) {
@@ -525,7 +589,7 @@ func (c *Coordinator) listResourceVersion(ctx context.Context, resource catalogd
 		for i := range list.Items {
 			item := &list.Items[i]
 			target := policyengine.Target{GroupResource: resource.GroupResource, Namespaced: version.Namespaced, Namespace: item.Namespace, Labels: item.Labels, NamespaceLabels: namespaceLabels[item.Namespace]}
-			selectedDeleting := item.DeletionTimestamp != nil && policyengine.SelectWinning(policies.items, target) != nil
+			selectedDeleting := item.DeletionTimestamp != nil && policies.selectWinning(target) != nil
 			_, trackedUID := tracked.uids[item.UID]
 			_, trackedIdentity := tracked.identities[objectIdentity(item.Namespace, item.Name)]
 			if !selectedDeleting && !trackedUID && !trackedIdentity {
@@ -534,7 +598,7 @@ func (c *Coordinator) listResourceVersion(ctx context.Context, resource catalogd
 			if selectedDeleting && !budget.reserve(item.UID) {
 				return retained, errTargetBound
 			}
-			retained = append(retained, *item.DeepCopy())
+			retained = append(retained, *item)
 		}
 		continueToken = list.Continue
 		if continueToken == "" {
@@ -543,9 +607,18 @@ func (c *Coordinator) listResourceVersion(ctx context.Context, resource catalogd
 	}
 }
 
-func (c *Coordinator) diagnoseTargets(ctx context.Context, observations map[types.UID]observation, snapshot diagnosis.Snapshot, now time.Time) error {
+func (c *Coordinator) diagnoseTargets(ctx context.Context, observations map[types.UID]observation, snapshot diagnosis.Snapshot, incidents *safetyv1alpha1.DeletionIncidentList, now time.Time) (bool, error) {
+	knownIncidents := make(map[types.UID]*safetyv1alpha1.DeletionIncident)
+	if incidents != nil {
+		knownIncidents = make(map[types.UID]*safetyv1alpha1.DeletionIncident, len(incidents.Items))
+		for i := range incidents.Items {
+			incident := &incidents.Items[i]
+			knownIncidents[incident.Spec.Target.UID] = incident
+		}
+	}
 	jobs := make(chan observation)
 	errs := make(chan error, len(observations))
+	var mutated atomic.Bool
 	var workers sync.WaitGroup
 	for range c.config.DiagnosisWorkers {
 		workers.Add(1)
@@ -557,7 +630,7 @@ func (c *Coordinator) diagnoseTargets(ctx context.Context, observations map[type
 					thresholdElapsed := observed.meta.DeletionTimestamp != nil && !now.Before(observed.meta.DeletionTimestamp.Add(observed.policy.Settings().TerminationAge))
 					result = diagnosis.Result{TargetFound: true, UIDMatches: true, ThresholdElapsed: thresholdElapsed}
 				}
-				persistErr := c.persistDiagnosis(ctx, observed, result, now)
+				persistErr := c.persistDiagnosis(ctx, observed, result, knownIncidents[observed.target.UID], &mutated, now)
 				err := errors.Join(diagnoseErr, persistErr)
 				if err != nil {
 					diagnoses.WithLabelValues("error").Inc()
@@ -584,13 +657,16 @@ func (c *Coordinator) diagnoseTargets(ctx context.Context, observations map[type
 	for err := range errs {
 		collected = append(collected, err)
 	}
-	return errors.Join(collected...)
+	return mutated.Load(), errors.Join(collected...)
 }
 
-func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation, result diagnosis.Result, now time.Time) error {
+func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation, result diagnosis.Result, existing *safetyv1alpha1.DeletionIncident, mutated *atomic.Bool, now time.Time) error {
 	name := incidentName(observed.target.UID)
-	var existing safetyv1alpha1.DeletionIncident
-	err := c.reader.Get(ctx, client.ObjectKey{Name: name}, &existing)
+	var err error
+	if existing == nil {
+		existing = &safetyv1alpha1.DeletionIncident{}
+		err = c.reader.Get(ctx, client.ObjectKey{Name: name}, existing)
+	}
 	switch {
 	case apierrors.IsNotFound(err):
 		if !result.TargetFound || !result.UIDMatches || !result.ThresholdElapsed {
@@ -600,19 +676,28 @@ func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation
 		if err := c.writer.Create(ctx, incident); err != nil && !apierrors.IsAlreadyExists(err) {
 			return err
 		}
+		mutated.Store(true)
 	case err != nil:
 		return err
 	case existing.Spec.Target.UID != observed.target.UID:
 		return fmt.Errorf("incident %s belongs to different target UID", name)
 	case !result.TargetFound:
+		mutated.Store(true)
 		return c.resolveIncident(ctx, name, "TargetAbsent", now)
 	case !result.UIDMatches:
+		mutated.Store(true)
 		return c.resolveIncident(ctx, name, "TargetReplaced", now)
 	}
+	var current *safetyv1alpha1.DeletionIncident
+	if err == nil {
+		current = existing
+	}
 	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		var current safetyv1alpha1.DeletionIncident
-		if err := c.reader.Get(ctx, client.ObjectKey{Name: name}, &current); err != nil {
-			return err
+		if current == nil {
+			current = &safetyv1alpha1.DeletionIncident{}
+			if err := c.reader.Get(ctx, client.ObjectKey{Name: name}, current); err != nil {
+				return err
+			}
 		}
 		retention := observed.policy.Settings().ResolvedIncidentTTL.String()
 		if current.Annotations[retentionAnnotation] != retention {
@@ -621,9 +706,11 @@ func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation
 				current.Annotations = make(map[string]string)
 			}
 			current.Annotations[retentionAnnotation] = retention
-			if err := c.writer.Patch(ctx, &current, client.MergeFrom(base)); err != nil {
+			if err := c.writer.Patch(ctx, current, client.MergeFrom(base)); err != nil {
+				current = nil
 				return err
 			}
+			mutated.Store(true)
 		}
 		desired := current.Status.DeepCopy()
 		desired.ActivePolicyRef = &safetyv1alpha1.PolicyReference{Name: observed.policy.Name(), UID: observed.policy.UID(), Generation: observed.policy.Generation()}
@@ -656,11 +743,14 @@ func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation
 			t := metav1.NewTime(now)
 			desired.LastObservedTime = &t
 		}
-		if reflect.DeepEqual(current.Status, *desired) {
+		if apiequality.Semantic.DeepEqual(current.Status, *desired) {
 			return nil
 		}
 		current.Status = *desired
-		return c.writer.Status().Update(ctx, &current)
+		mutated.Store(true)
+		err := c.writer.Status().Update(ctx, current)
+		current = nil
+		return err
 	})
 	if apierrors.IsRequestEntityTooLargeError(err) {
 		fallbackErr := c.failIncidentDiagnosis(ctx, name, now, "EvidenceTooLarge", "diagnostic evidence exceeded the Kubernetes object size limit")
@@ -669,17 +759,21 @@ func (c *Coordinator) persistDiagnosis(ctx context.Context, observed observation
 	return err
 }
 
-func (c *Coordinator) reconcileLifecycle(ctx context.Context, observations map[types.UID]observation, coverage map[schema.GroupResource]resourceCoverage, catalog catalogdiscovery.Snapshot, policies compiledPolicies, now time.Time) error {
-	var incidents safetyv1alpha1.DeletionIncidentList
-	if err := c.reader.List(ctx, &incidents); err != nil {
-		return fmt.Errorf("list incidents: %w", err)
+func (c *Coordinator) reconcileLifecycle(ctx context.Context, observations map[types.UID]observation, coverage map[schema.GroupResource]resourceCoverage, catalog catalogdiscovery.Snapshot, policies compiledPolicies, incidents *safetyv1alpha1.DeletionIncidentList, now time.Time) (bool, error) {
+	if incidents == nil {
+		incidents = &safetyv1alpha1.DeletionIncidentList{}
+		if err := c.reader.List(ctx, incidents); err != nil {
+			return false, fmt.Errorf("list incidents: %w", err)
+		}
 	}
+	mutated := false
 	var errs []error
 	for i := range incidents.Items {
 		incident := &incidents.Items[i]
 		if incident.Status.Phase == safetyv1alpha1.IncidentPhaseResolved {
 			retention, known := incidentRetention(incident, policies)
 			if known && incident.Status.ResolvedTime != nil && !now.Before(incident.Status.ResolvedTime.Add(retention)) {
+				mutated = true
 				if err := c.writer.Delete(ctx, incident); err != nil && !apierrors.IsNotFound(err) {
 					errs = append(errs, err)
 				}
@@ -691,6 +785,7 @@ func (c *Coordinator) reconcileLifecycle(ctx context.Context, observations map[t
 		}
 		gr := schema.GroupResource{Group: incident.Spec.Target.APIGroup, Resource: incident.Spec.Target.Resource}
 		if _, exists := catalog.Resolve(gr); !exists {
+			mutated = true
 			if err := c.resolveIncident(ctx, incident.Name, "ResourceTypeRemoved", now); err != nil {
 				errs = append(errs, err)
 			}
@@ -701,6 +796,7 @@ func (c *Coordinator) reconcileLifecycle(ctx context.Context, observations map[t
 			continue
 		}
 		if !state.success {
+			mutated = true
 			if err := c.failIncidentDiagnosis(ctx, incident.Name, now, "ResourceListFailed", "resource coverage is incomplete"); err != nil {
 				errs = append(errs, err)
 			}
@@ -711,23 +807,26 @@ func (c *Coordinator) reconcileLifecycle(ctx context.Context, observations map[t
 			if currentUID, sameName := state.identities[objectIdentity(incident.Spec.Target.Namespace, incident.Spec.Target.Name)]; sameName && currentUID != incident.Spec.Target.UID {
 				reason = "TargetReplaced"
 			}
+			mutated = true
 			if err := c.resolveIncident(ctx, incident.Name, reason, now); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
 		if _, selected := state.selectedUIDs[incident.Spec.Target.UID]; !selected {
+			mutated = true
 			if err := c.resolveIncident(ctx, incident.Name, "PolicyNoLongerMatches", now); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
 		// A successfully covered, selected target omitted from work is no longer deleting.
+		mutated = true
 		if err := c.resolveIncident(ctx, incident.Name, "TargetNoLongerDeleting", now); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...)
+	return mutated, errors.Join(errs...)
 }
 
 func (c *Coordinator) failActiveIncidentDiagnoses(ctx context.Context, now time.Time, reason, message string) error {
@@ -775,7 +874,7 @@ func (c *Coordinator) failIncidentDiagnosis(ctx context.Context, name string, no
 			{Type: "DiagnosisComplete", Status: metav1.ConditionFalse, Reason: reason, Message: message, LastTransitionTime: transitionTime, ObservedGeneration: current.Generation},
 			{Type: "TargetVisible", Status: metav1.ConditionUnknown, Reason: reason, Message: "target visibility is unknown because current evidence is incomplete", LastTransitionTime: transitionTime, ObservedGeneration: current.Generation},
 		})
-		if reflect.DeepEqual(*before, current.Status) {
+		if apiequality.Semantic.DeepEqual(*before, current.Status) {
 			return nil
 		}
 		return c.writer.Status().Update(ctx, &current)
@@ -802,10 +901,12 @@ func (c *Coordinator) resolveIncident(ctx context.Context, name, reason string, 
 	})
 }
 
-func (c *Coordinator) updateIncidentMetrics(ctx context.Context) {
-	var incidents safetyv1alpha1.DeletionIncidentList
-	if err := c.reader.List(ctx, &incidents); err != nil {
-		return
+func (c *Coordinator) updateIncidentMetrics(ctx context.Context, incidents *safetyv1alpha1.DeletionIncidentList) {
+	if incidents == nil {
+		incidents = &safetyv1alpha1.DeletionIncidentList{}
+		if err := c.reader.List(ctx, incidents); err != nil {
+			return
+		}
 	}
 	counts := map[safetyv1alpha1.IncidentPhase]int{}
 	for i := range incidents.Items {

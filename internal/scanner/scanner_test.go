@@ -17,6 +17,8 @@ package scanner
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +41,7 @@ import (
 	safetyv1alpha1 "github.com/erayack/exitguard/api/v1alpha1"
 	"github.com/erayack/exitguard/internal/diagnosis"
 	catalogdiscovery "github.com/erayack/exitguard/internal/discovery"
+	policyengine "github.com/erayack/exitguard/internal/policy"
 )
 
 func TestRunCycleCreatesResolvesAndRetainsIncident(t *testing.T) {
@@ -149,6 +152,240 @@ func TestRunCyclePreservesPolicyConditionTransitionTimes(t *testing.T) {
 	}
 	if policy.Status.LastValidatedTime == nil || !policy.Status.LastValidatedTime.After(firstValidation.Time) {
 		t.Fatalf("lastValidatedTime = %v, want after %s", policy.Status.LastValidatedTime, firstValidation)
+	}
+}
+
+func TestUpdatePolicyStatusHandlesStaleListedObjects(t *testing.T) {
+	t.Run("conflict fetches current policy before retry", func(t *testing.T) {
+		coordinator, _, store, now := testCoordinator(t)
+		ctx := context.Background()
+		if err := coordinator.RunCycle(ctx); err != nil {
+			t.Fatalf("initial cycle: %v", err)
+		}
+		var stale safetyv1alpha1.TerminationPolicy
+		if err := store.Get(ctx, client.ObjectKey{Name: "policy"}, &stale); err != nil {
+			t.Fatal(err)
+		}
+		desired := *stale.Status.DeepCopy()
+		desired.ResolvedResourceCount = 1
+		validated := metav1.NewTime(now.Add(time.Minute))
+		desired.LastValidatedTime = &validated
+
+		hookClient := &statusUpdateHookClient{Client: store}
+		hookClient.beforeFirstUpdate = func(client.Object) error {
+			var concurrent safetyv1alpha1.TerminationPolicy
+			if err := store.Get(ctx, client.ObjectKey{Name: stale.Name}, &concurrent); err != nil {
+				return err
+			}
+			concurrent.Status.ResolvedResourceCount = 99
+			if err := store.Status().Update(ctx, &concurrent); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "terminationpolicies"}, stale.Name, errors.New("stale listed policy"))
+		}
+		coordinator.writer = hookClient
+
+		if err := coordinator.updatePolicyStatus(ctx, &stale, desired); err != nil {
+			t.Fatalf("update policy status after conflict: %v", err)
+		}
+		var updated safetyv1alpha1.TerminationPolicy
+		if err := store.Get(ctx, client.ObjectKey{Name: stale.Name}, &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.ResolvedResourceCount != desired.ResolvedResourceCount {
+			t.Fatalf("status after retry = %#v, want resolved resource count %d", updated.Status, desired.ResolvedResourceCount)
+		}
+		if attempts := hookClient.statusUpdateAttempts.Load(); attempts != 2 {
+			t.Fatalf("status update attempts = %d, want 2", attempts)
+		}
+	})
+
+	t.Run("deletion during conflict retry is returned without recreation", func(t *testing.T) {
+		coordinator, _, store, _ := testCoordinator(t)
+		ctx := context.Background()
+		var stale safetyv1alpha1.TerminationPolicy
+		if err := store.Get(ctx, client.ObjectKey{Name: "policy"}, &stale); err != nil {
+			t.Fatal(err)
+		}
+		desired := safetyv1alpha1.TerminationPolicyStatus{ObservedGeneration: stale.Generation}
+		hookClient := &statusUpdateHookClient{Client: store}
+		hookClient.beforeFirstUpdate = func(client.Object) error {
+			if err := store.Delete(ctx, &stale); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "terminationpolicies"}, stale.Name, errors.New("policy deleted"))
+		}
+		coordinator.writer = hookClient
+
+		err := coordinator.updatePolicyStatus(ctx, &stale, desired)
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("update after deletion error = %v, want NotFound", err)
+		}
+		var current safetyv1alpha1.TerminationPolicy
+		if err := store.Get(ctx, client.ObjectKey{Name: stale.Name}, &current); !apierrors.IsNotFound(err) {
+			t.Fatalf("deleted policy was recreated: %v", err)
+		}
+	})
+}
+
+func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
+	setup := func(t *testing.T) (*Coordinator, client.Client, observation, diagnosis.Result, safetyv1alpha1.DeletionIncident, *atomic.Bool) {
+		t.Helper()
+		coordinator, _, store, now := testCoordinator(t)
+		ctx := context.Background()
+		if err := coordinator.RunCycle(ctx); err != nil {
+			t.Fatalf("initial cycle: %v", err)
+		}
+		var incident safetyv1alpha1.DeletionIncident
+		if err := store.Get(ctx, client.ObjectKey{Name: "deletion-target-uid"}, &incident); err != nil {
+			t.Fatal(err)
+		}
+		compiled, err := coordinator.compilePolicies(ctx, coordinator.catalog.Snapshot(), *now)
+		if err != nil {
+			t.Fatalf("compile policy: %v", err)
+		}
+		target := incident.Spec.Target
+		observed := observation{
+			target: target,
+			policy: compiled.byUID["policy-uid"],
+			meta: metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{
+				Name:              target.Name,
+				Namespace:         target.Namespace,
+				UID:               target.UID,
+				ResourceVersion:   "8",
+				DeletionTimestamp: incident.Status.DeletionTimestamp.DeepCopy(),
+				Finalizers:        []string{"example.io/finalizer"},
+			}},
+		}
+		result := diagnosis.Result{
+			TargetFound:       true,
+			UIDMatches:        true,
+			ThresholdElapsed:  true,
+			DiagnosisComplete: true,
+			TargetSnapshot: safetyv1alpha1.TargetSnapshot{
+				ResourceVersion:    "8",
+				MetadataFinalizers: []string{"example.io/finalizer"},
+			},
+		}
+		return coordinator, store, observed, result, incident, &atomic.Bool{}
+	}
+
+	t.Run("conflict fetches current incident before retry", func(t *testing.T) {
+		coordinator, store, observed, result, stale, mutated := setup(t)
+		ctx := context.Background()
+		hookClient := &statusUpdateHookClient{Client: store}
+		hookClient.beforeFirstUpdate = func(client.Object) error {
+			var concurrent safetyv1alpha1.DeletionIncident
+			if err := store.Get(ctx, client.ObjectKey{Name: stale.Name}, &concurrent); err != nil {
+				return err
+			}
+			concurrent.Status.ResolutionReason = "concurrent-change"
+			if err := store.Status().Update(ctx, &concurrent); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "deletionincidents"}, stale.Name, errors.New("stale incident snapshot"))
+		}
+		coordinator.writer = hookClient
+
+		if err := coordinator.persistDiagnosis(ctx, observed, result, &stale, mutated, time.Now().UTC()); err != nil {
+			t.Fatalf("persist diagnosis after conflict: %v", err)
+		}
+		var updated safetyv1alpha1.DeletionIncident
+		if err := store.Get(ctx, client.ObjectKey{Name: stale.Name}, &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.ActivePolicyRef == nil || updated.Status.ActivePolicyRef.UID != "policy-uid" || updated.Status.ResolutionReason != "" || updated.Status.TargetSnapshot.ResourceVersion != "8" {
+			t.Fatalf("unexpected status after retry: %#v", updated.Status)
+		}
+		if !mutated.Load() {
+			t.Fatal("persisted status was not reported as mutated")
+		}
+		if attempts := hookClient.statusUpdateAttempts.Load(); attempts != 2 {
+			t.Fatalf("status update attempts = %d, want 2", attempts)
+		}
+	})
+
+	t.Run("deletion during conflict retry is returned without recreation", func(t *testing.T) {
+		coordinator, store, observed, result, stale, mutated := setup(t)
+		ctx := context.Background()
+		hookClient := &statusUpdateHookClient{Client: store}
+		hookClient.beforeFirstUpdate = func(client.Object) error {
+			if err := store.Delete(ctx, &stale); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "deletionincidents"}, stale.Name, errors.New("incident deleted"))
+		}
+		coordinator.writer = hookClient
+
+		err := coordinator.persistDiagnosis(ctx, observed, result, &stale, mutated, time.Now().UTC())
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("persist after deletion error = %v, want NotFound", err)
+		}
+		var current safetyv1alpha1.DeletionIncident
+		if err := store.Get(ctx, client.ObjectKey{Name: stale.Name}, &current); !apierrors.IsNotFound(err) {
+			t.Fatalf("deleted incident was recreated: %v", err)
+		}
+	})
+}
+
+func TestCompilePoliciesCacheMatchesFreshCompilationAndInvalidatesOnCatalogChange(t *testing.T) {
+	coordinator, _, store, now := testCoordinator(t)
+	ctx := context.Background()
+	catalog := coordinator.catalog.Snapshot()
+	first, err := coordinator.compilePolicies(ctx, catalog, *now)
+	if err != nil {
+		t.Fatalf("first compile: %v", err)
+	}
+	*now = now.Add(time.Minute)
+	cached, err := coordinator.compilePolicies(ctx, catalog, *now)
+	if err != nil {
+		t.Fatalf("cached compile: %v", err)
+	}
+	firstPolicy, cachedPolicy := first.byUID["policy-uid"], cached.byUID["policy-uid"]
+	if firstPolicy != cachedPolicy {
+		t.Fatal("unchanged policy and catalog did not reuse the compiled policy")
+	}
+	var source safetyv1alpha1.TerminationPolicy
+	if err := store.Get(ctx, client.ObjectKey{Name: "policy"}, &source); err != nil {
+		t.Fatal(err)
+	}
+	fresh, _ := policyengine.Compile(&source, catalog, *now)
+	samePolicyIdentity := cachedPolicy.Name() == fresh.Name() &&
+		cachedPolicy.UID() == fresh.UID() &&
+		cachedPolicy.Generation() == fresh.Generation()
+	samePolicyBehavior := cachedPolicy.Priority() == fresh.Priority() &&
+		cachedPolicy.Ready() == fresh.Ready() &&
+		reflect.DeepEqual(cachedPolicy.Settings(), fresh.Settings()) &&
+		reflect.DeepEqual(cachedPolicy.ResolvedGroupResources(), fresh.ResolvedGroupResources())
+	if !samePolicyIdentity || !samePolicyBehavior {
+		t.Fatalf("cached policy behavior differs from fresh compilation: cached=%#v fresh=%#v", cachedPolicy, fresh)
+	}
+	for _, target := range []policyengine.Target{
+		{GroupResource: schema.GroupResource{Resource: "pods"}, Namespaced: true, Namespace: "ns"},
+		{GroupResource: schema.GroupResource{Resource: "configmaps"}, Namespaced: true, Namespace: "ns"},
+	} {
+		if cachedPolicy.Match(target) != fresh.Match(target) {
+			t.Fatalf("cached match result differs from fresh compilation for %s", target.GroupResource)
+		}
+	}
+
+	changedCatalog := scannerTestCatalogSnapshot(t, metav1.APIResource{Name: "configmaps", SingularName: "configmap", Namespaced: true, Kind: "ConfigMap", Verbs: metav1.Verbs{"get", "list"}})
+	invalidated, err := coordinator.compilePolicies(ctx, changedCatalog, *now)
+	if err != nil {
+		t.Fatalf("compile after catalog change: %v", err)
+	}
+	invalidatedPolicy := invalidated.byUID["policy-uid"]
+	if invalidatedPolicy == cachedPolicy {
+		t.Fatal("catalog change reused the cached compiled policy")
+	}
+	if invalidatedPolicy.Ready() {
+		t.Fatalf("policy remained ready after its resource disappeared from discovery: %#v", invalidatedPolicy)
+	}
+	if err := store.Get(ctx, client.ObjectKey{Name: "policy"}, &source); err != nil {
+		t.Fatal(err)
+	}
+	if source.Status.ResolvedResourceCount != 0 || len(source.Status.Conditions) == 0 || source.Status.Conditions[0].Status != metav1.ConditionFalse {
+		t.Fatalf("status did not reflect changed discovery catalog: %#v", source.Status)
 	}
 }
 
@@ -492,6 +729,17 @@ func testCoordinatorWithDynamic(t *testing.T) (*Coordinator, *metadatafake.FakeM
 	return coordinator, metadataClient, dynamicClient, store, now
 }
 
+func scannerTestCatalogSnapshot(t *testing.T, resources ...metav1.APIResource) catalogdiscovery.Snapshot {
+	t.Helper()
+	discovery := &fake.FakeDiscovery{Fake: &k8stesting.Fake{}}
+	discovery.Resources = []*metav1.APIResourceList{{GroupVersion: "v1", APIResources: resources}}
+	catalog := catalogdiscovery.NewCatalog(discovery, time.Hour, discardLogger())
+	if err := catalog.Refresh(); err != nil {
+		t.Fatalf("refresh test catalog: %v", err)
+	}
+	return catalog.Snapshot()
+}
+
 func fakeMetadataList(continueToken string, items ...metav1.PartialObjectMetadata) *metav1.List {
 	list := &metav1.List{ListMeta: metav1.ListMeta{Continue: continueToken}, Items: make([]runtime.RawExtension, len(items))}
 	for i := range items {
@@ -510,6 +758,32 @@ func (r snapshotFailingReader) List(ctx context.Context, list client.ObjectList,
 		return errors.New("snapshot list failed")
 	}
 	return r.Reader.List(ctx, list, options...)
+}
+
+type statusUpdateHookClient struct {
+	client.Client
+	beforeFirstUpdate    func(client.Object) error
+	statusUpdateAttempts atomic.Int64
+}
+
+func (c *statusUpdateHookClient) Status() client.SubResourceWriter {
+	return &statusUpdateHookWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type statusUpdateHookWriter struct {
+	client.SubResourceWriter
+	client *statusUpdateHookClient
+}
+
+func (w *statusUpdateHookWriter) Update(ctx context.Context, object client.Object, options ...client.SubResourceUpdateOption) error {
+	w.client.statusUpdateAttempts.Add(1)
+	if hook := w.client.beforeFirstUpdate; hook != nil {
+		w.client.beforeFirstUpdate = nil
+		if err := hook(object); err != nil {
+			return err
+		}
+	}
+	return w.SubResourceWriter.Update(ctx, object, options...)
 }
 
 type oversizedDiagnosisClient struct {
