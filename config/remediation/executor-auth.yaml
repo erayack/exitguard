@@ -1,0 +1,26 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: exitguard-executor-auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: exitguard-executor
+    namespace: exitguard-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: exitguard-executor-authentication-reader
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: exitguard-executor
+    namespace: exitguard-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader

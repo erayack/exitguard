@@ -1,0 +1,444 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: terminationpolicies.safety.exitguard.io
+spec:
+  group: safety.exitguard.io
+  names:
+    kind: TerminationPolicy
+    listKind: TerminationPolicyList
+    plural: terminationpolicies
+    shortNames:
+    - tpolicy
+    - tp
+    singular: terminationpolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.resolvedResourceCount
+      name: Resources
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: TerminationPolicy declares which deleting resources to diagnose
+          and which actions may be approved.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: TerminationPolicySpec selects targets and sets diagnosis
+              and remediation limits.
+            properties:
+              diagnosis:
+                default:
+                  checkAPIServices: true
+                  checkWebhooks: true
+                  maxCRDInstances: 5000
+                  maxNamespaceObjects: 5000
+                description: Diagnosis configures bounded, read-only evidence collection.
+                properties:
+                  checkAPIServices:
+                    default: true
+                    description: CheckAPIServices enables aggregated API availability
+                      diagnosis.
+                    type: boolean
+                  checkWebhooks:
+                    default: true
+                    description: CheckWebhooks enables fail-closed admission webhook
+                      diagnosis.
+                    type: boolean
+                  maxCRDInstances:
+                    default: 5000
+                    description: MaxCRDInstances bounds custom-resource instances
+                      enumerated for one terminating CRD.
+                    format: int32
+                    maximum: 100000
+                    minimum: 1
+                    type: integer
+                  maxNamespaceObjects:
+                    default: 5000
+                    description: MaxNamespaceObjects bounds objects enumerated in
+                      one terminating namespace.
+                    format: int32
+                    maximum: 100000
+                    minimum: 1
+                    type: integer
+                required:
+                - checkAPIServices
+                - checkWebhooks
+                - maxCRDInstances
+                - maxNamespaceObjects
+                type: object
+              finalizerOwners:
+                description: FinalizerOwners contains exact, deterministic finalizer
+                  ownership mappings.
+                items:
+                  description: FinalizerOwner maps an exact finalizer to the workload
+                    responsible for it.
+                  properties:
+                    controllerRef:
+                      description: ControllerRef identifies the workload whose availability
+                        should be checked.
+                      properties:
+                        apiVersion:
+                          description: APIVersion must identify the apps API used
+                            by the controller workload.
+                          enum:
+                          - apps/v1
+                          type: string
+                        kind:
+                          description: Kind is a supported controller workload.
+                          enum:
+                          - Deployment
+                          - StatefulSet
+                          - DaemonSet
+                          type: string
+                        name:
+                          description: Name is the controller workload name.
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Namespace contains the controller workload.
+                          minLength: 1
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      - namespace
+                      type: object
+                    finalizer:
+                      description: Finalizer is an exact finalizer key. Wildcards
+                        are not supported.
+                      minLength: 1
+                      type: string
+                  required:
+                  - controllerRef
+                  - finalizer
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - finalizer
+                x-kubernetes-list-type: map
+              priority:
+                default: 0
+                description: Priority selects the winning policy; higher values win
+                  and names break ties.
+                format: int32
+                type: integer
+              remediation:
+                default:
+                  allowNamespaceForce: false
+                  approvalTTL: 1h
+                  maxRisk: None
+                description: Remediation limits action eligibility but never triggers
+                  automatic mutation.
+                properties:
+                  allowNamespaceForce:
+                    default: false
+                    description: AllowNamespaceForce permits Critical namespace force-finalization
+                      actions.
+                    type: boolean
+                  allowedFinalizers:
+                    description: AllowedFinalizers is an exact allowlist. Wildcards
+                      are not supported.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  approvalTTL:
+                    default: 1h
+                    description: ApprovalTTL is measured from RemediationApproval
+                      creation time.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: approvalTTL must be positive
+                      rule: duration(self) > duration('0s')
+                  maxRisk:
+                    default: None
+                    description: MaxRisk is the highest action risk eligible for approval.
+                    enum:
+                    - None
+                    - Low
+                    - Medium
+                    - High
+                    - Critical
+                    type: string
+                required:
+                - allowNamespaceForce
+                - approvalTTL
+                - maxRisk
+                type: object
+              retention:
+                default:
+                  resolvedIncidentTTL: 720h
+                description: Retention controls cleanup of resolved incidents.
+                properties:
+                  resolvedIncidentTTL:
+                    default: 720h
+                    description: ResolvedIncidentTTL controls how long resolved incidents
+                      and owned approvals remain.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: resolvedIncidentTTL must be positive
+                      rule: duration(self) > duration('0s')
+                required:
+                - resolvedIncidentTTL
+                type: object
+              targetRules:
+                description: TargetRules are ORed; selectors within a rule are ANDed.
+                items:
+                  description: TargetRule selects REST resources and objects monitored
+                    by a TerminationPolicy.
+                  properties:
+                    apiGroups:
+                      description: APIGroups contains API group names. The empty string
+                        means core and "*" means all groups.
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: set
+                    excludedNamespaces:
+                      description: ExcludedNamespaces is an exact namespace denylist
+                        for namespaced targets.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
+                    namespaceSelector:
+                      description: NamespaceSelector selects namespaces for namespaced
+                        targets.
+                      properties:
+                        matchExpressions:
+                          description: matchExpressions is a list of label selector
+                            requirements. The requirements are ANDed.
+                          items:
+                            description: |-
+                              A label selector requirement is a selector that contains values, a key, and an operator that
+                              relates the key and values.
+                            properties:
+                              key:
+                                description: key is the label key that the selector
+                                  applies to.
+                                type: string
+                              operator:
+                                description: |-
+                                  operator represents a key's relationship to a set of values.
+                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                type: string
+                              values:
+                                description: |-
+                                  values is an array of string values. If the operator is In or NotIn,
+                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                  the values array must be empty. This array is replaced during a strategic
+                                  merge patch.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                            operator is "In", and the values array contains only "value". The requirements are ANDed.
+                          type: object
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    objectSelector:
+                      description: ObjectSelector selects targets by object labels.
+                      properties:
+                        matchExpressions:
+                          description: matchExpressions is a list of label selector
+                            requirements. The requirements are ANDed.
+                          items:
+                            description: |-
+                              A label selector requirement is a selector that contains values, a key, and an operator that
+                              relates the key and values.
+                            properties:
+                              key:
+                                description: key is the label key that the selector
+                                  applies to.
+                                type: string
+                              operator:
+                                description: |-
+                                  operator represents a key's relationship to a set of values.
+                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                type: string
+                              values:
+                                description: |-
+                                  values is an array of string values. If the operator is In or NotIn,
+                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                  the values array must be empty. This array is replaced during a strategic
+                                  merge patch.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                            operator is "In", and the values array contains only "value". The requirements are ANDed.
+                          type: object
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    resources:
+                      description: Resources contains plural REST resource names.
+                        "*" means all eligible resources.
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: set
+                  required:
+                  - apiGroups
+                  - resources
+                  type: object
+                minItems: 1
+                type: array
+              terminationAge:
+                default: 10m
+                description: TerminationAge is the minimum deletion age before a new
+                  incident is created.
+                type: string
+                x-kubernetes-validations:
+                - message: terminationAge must be positive
+                  rule: duration(self) > duration('0s')
+            required:
+            - diagnosis
+            - priority
+            - remediation
+            - retention
+            - targetRules
+            - terminationAge
+            type: object
+          status:
+            description: TerminationPolicyStatus reports policy compilation and discovery
+              readiness.
+            properties:
+              conditions:
+                description: Conditions report Ready, DiscoveryResolved, and SelectorsValid
+                  state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastValidatedTime:
+                description: LastValidatedTime is the latest completed validation.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the latest policy generation compiled
+                  by the scanner.
+                format: int64
+                type: integer
+              resolvedResourceCount:
+                description: ResolvedResourceCount is the number of GroupResources
+                  selected by discovery.
+                format: int32
+                minimum: 0
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

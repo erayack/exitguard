@@ -1,0 +1,12 @@
+# Replace incidentRef values and actionID with values from one current DeletionIncident.
+apiVersion: safety.exitguard.io/v1alpha1
+kind: RemediationApproval
+metadata:
+  name: example-dry-run
+spec:
+  incidentRef:
+    name: replace-with-incident-name
+    uid: replace-with-current-incident-uid
+  actionID: replace-with-recommended-action-id
+  dryRun: true
+  reason: Validate the explicitly allowlisted action before approving a persistent mutation

@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../crd
+  - namespace.yaml
+  - ../rbac
+  - scanner-serviceaccount.yaml
+  - scanner-role.yaml
+  - scanner-rolebinding.yaml
+  - scanner-clusterrole.yaml
+  - scanner-clusterrolebinding.yaml
+  - scanner-auth.yaml
+  - metrics-reader-role.yaml
+  - scanner-deployment.yaml
+  - scanner-metrics-service.yaml
+images:
+  - name: exitguard
+    newName: exitguard
+    newTag: latest

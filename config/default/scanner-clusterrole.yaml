@@ -1,0 +1,40 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: exitguard-scanner
+rules:
+  # Discovery and metadata scanning are read-only across served resources.
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  - nonResourceURLs: ["/api", "/api/*", "/apis", "/apis/*"]
+    verbs: ["get"]
+  # Watches are deliberately limited to concrete operator and diagnosis resources.
+  - apiGroups: ["safety.exitguard.io"]
+    resources: ["terminationpolicies", "deletionincidents"]
+    verbs: ["watch"]
+  - apiGroups: [""]
+    resources: ["namespaces", "services"]
+    verbs: ["watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+    verbs: ["watch"]
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: ["apiservices"]
+    verbs: ["watch"]
+  # Scanner-owned durable records and status.
+  - apiGroups: ["safety.exitguard.io"]
+    resources: ["deletionincidents"]
+    verbs: ["create", "update", "patch", "delete"]
+  - apiGroups: ["safety.exitguard.io"]
+    resources: ["deletionincidents/status", "terminationpolicies/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]

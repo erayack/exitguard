@@ -1,0 +1,32 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: exitguard
+  namespace: exitguard-system
+  labels:
+    app.kubernetes.io/name: exitguard
+spec:
+  groups:
+    - name: exitguard.rules
+      rules:
+        - alert: ExitGuardScannerErrors
+          expr: increase(exitguard_scanner_cycles_total{result="error"}[10m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: exitguard scanner cycles are failing
+        - alert: ExitGuardDiscoveryUnavailable
+          expr: increase(exitguard_discovery_refreshes_total{result="error"}[15m]) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: exitguard API discovery refreshes are failing
+        - alert: ExitGuardScannerDown
+          expr: up{service="exitguard-scanner-metrics"} == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: exitguard scanner metrics target is down

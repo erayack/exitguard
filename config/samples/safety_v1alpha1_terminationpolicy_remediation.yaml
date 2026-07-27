@@ -1,0 +1,29 @@
+apiVersion: safety.exitguard.io/v1alpha1
+kind: TerminationPolicy
+metadata:
+  name: allowlisted-remediation
+spec:
+  priority: 100
+  targetRules:
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      namespaceSelector:
+        matchLabels:
+          safety.exitguard.io/remediation: allowed
+      excludedNamespaces:
+        - kube-system
+        - exitguard-system
+  terminationAge: 30m
+  diagnosis:
+    checkAPIServices: true
+    checkWebhooks: true
+    maxNamespaceObjects: 1000
+    maxCRDInstances: 1000
+  remediation:
+    maxRisk: Medium
+    allowedFinalizers:
+      - cleanup.example.com/finalizer
+    allowNamespaceForce: false
+    approvalTTL: 30m
+  retention:
+    resolvedIncidentTTL: 168h

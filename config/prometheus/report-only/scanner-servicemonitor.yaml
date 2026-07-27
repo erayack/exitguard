@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: exitguard-scanner
+  namespace: exitguard-system
+  labels:
+    app.kubernetes.io/name: exitguard
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: exitguard
+      app.kubernetes.io/component: scanner
+  endpoints:
+    - port: https
+      scheme: https
+      path: /metrics
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true

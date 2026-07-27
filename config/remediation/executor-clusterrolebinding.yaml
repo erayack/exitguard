@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: exitguard-executor
+subjects:
+  - kind: ServiceAccount
+    name: exitguard-executor
+    namespace: exitguard-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: exitguard-executor

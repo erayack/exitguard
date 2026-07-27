@@ -1,0 +1,31 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: exitguard-viewer
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["safety.exitguard.io"]
+    resources: ["terminationpolicies", "deletionincidents", "remediationapprovals"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: exitguard-policy-editor
+rules:
+  - apiGroups: ["safety.exitguard.io"]
+    resources: ["terminationpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: exitguard-approver
+rules:
+  - apiGroups: ["safety.exitguard.io"]
+    resources: ["remediationapprovals"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["safety.exitguard.io"]
+    resources: ["deletionincidents", "terminationpolicies"]
+    verbs: ["get", "list", "watch"]

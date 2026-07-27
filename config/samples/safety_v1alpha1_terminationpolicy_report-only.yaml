@@ -1,0 +1,27 @@
+apiVersion: safety.exitguard.io/v1alpha1
+kind: TerminationPolicy
+metadata:
+  name: report-only
+spec:
+  priority: 0
+  targetRules:
+    - apiGroups: ["*"]
+      resources: ["*"]
+      excludedNamespaces:
+        - kube-system
+        - kube-public
+        - kube-node-lease
+        - exitguard-system
+  terminationAge: 10m
+  diagnosis:
+    checkAPIServices: true
+    checkWebhooks: true
+    maxNamespaceObjects: 5000
+    maxCRDInstances: 5000
+  remediation:
+    maxRisk: None
+    allowedFinalizers: []
+    allowNamespaceForce: false
+    approvalTTL: 1h
+  retention:
+    resolvedIncidentTTL: 720h
