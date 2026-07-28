@@ -114,17 +114,19 @@ func Compile(source *safetyv1alpha1.TerminationPolicy, catalog catalogdiscovery.
 	selectorErrors := make([]string, 0)
 	resolutionErrors := make([]string, 0)
 	resolved := make(map[schema.GroupResource]struct{})
+	// Resources are shared across compiled rules and must remain immutable.
+	catalogResources := catalog.Resources()
 	for index, rule := range source.Spec.TargetRules {
 		compiledRule, selectorErrs := compileRuleSelectors(rule)
 		for _, err := range selectorErrs {
 			selectorErrors = append(selectorErrors, fmt.Sprintf("rule %d: %v", index, err))
 		}
 
-		for _, resource := range resolveRule(rule, catalog) {
+		for _, resource := range resolveRule(rule, catalogResources) {
 			compiledRule.resources[resource.GroupResource] = resource
 			resolved[resource.GroupResource] = struct{}{}
 		}
-		resolutionErrors = append(resolutionErrors, unresolvedSelections(index, rule, catalog)...)
+		resolutionErrors = append(resolutionErrors, unresolvedSelections(index, rule, catalog, catalogResources)...)
 		compiled.rules = append(compiled.rules, compiledRule)
 	}
 
@@ -332,10 +334,10 @@ func compileRuleSelectors(rule safetyv1alpha1.TargetRule) (compiledRule, []error
 	return compiled, errs
 }
 
-func resolveRule(rule safetyv1alpha1.TargetRule, catalog catalogdiscovery.Snapshot) []catalogdiscovery.Resource {
+func resolveRule(rule safetyv1alpha1.TargetRule, resources []catalogdiscovery.Resource) []catalogdiscovery.Resource {
 	resourceWildcard := slices.Contains(rule.Resources, "*")
 	resolved := make([]catalogdiscovery.Resource, 0)
-	for _, resource := range catalog.Resources() {
+	for _, resource := range resources {
 		if !matchesToken(rule.APIGroups, resource.GroupResource.Group) || !matchesToken(rule.Resources, resource.GroupResource.Resource) {
 			continue
 		}
@@ -347,7 +349,7 @@ func resolveRule(rule safetyv1alpha1.TargetRule, catalog catalogdiscovery.Snapsh
 	return resolved
 }
 
-func unresolvedSelections(index int, rule safetyv1alpha1.TargetRule, catalog catalogdiscovery.Snapshot) []string {
+func unresolvedSelections(index int, rule safetyv1alpha1.TargetRule, catalog catalogdiscovery.Snapshot, resources []catalogdiscovery.Resource) []string {
 	exactGroups := withoutWildcard(rule.APIGroups)
 	exactResources := withoutWildcard(rule.Resources)
 	groupWildcard := slices.Contains(rule.APIGroups, "*")
@@ -363,7 +365,7 @@ func unresolvedSelections(index int, rule safetyv1alpha1.TargetRule, catalog cat
 	}
 	if groupWildcard {
 		for _, resource := range exactResources {
-			if !anyResource(catalog, func(candidate catalogdiscovery.Resource) bool {
+			if !anyResource(resources, func(candidate catalogdiscovery.Resource) bool {
 				return candidate.GroupResource.Resource == resource
 			}) {
 				unresolved = append(unresolved, formatSelection(index, "*", resource))
@@ -372,13 +374,13 @@ func unresolvedSelections(index int, rule safetyv1alpha1.TargetRule, catalog cat
 	}
 	if resourceWildcard {
 		for _, group := range exactGroups {
-			if !anyResource(catalog, func(candidate catalogdiscovery.Resource) bool {
+			if !anyResource(resources, func(candidate catalogdiscovery.Resource) bool {
 				return candidate.GroupResource.Group == group && candidate.EligibleForWildcard()
 			}) {
 				unresolved = append(unresolved, formatSelection(index, group, "*"))
 			}
 		}
-		if groupWildcard && !anyResource(catalog, func(candidate catalogdiscovery.Resource) bool {
+		if groupWildcard && !anyResource(resources, func(candidate catalogdiscovery.Resource) bool {
 			return candidate.EligibleForWildcard()
 		}) {
 			unresolved = append(unresolved, formatSelection(index, "*", "*"))
@@ -475,8 +477,8 @@ func withoutWildcard(values []string) []string {
 	return result
 }
 
-func anyResource(catalog catalogdiscovery.Snapshot, predicate func(catalogdiscovery.Resource) bool) bool {
-	for _, resource := range catalog.Resources() {
+func anyResource(resources []catalogdiscovery.Resource, predicate func(catalogdiscovery.Resource) bool) bool {
+	for _, resource := range resources {
 		if predicate(resource) {
 			return true
 		}
