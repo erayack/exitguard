@@ -198,9 +198,26 @@ type collector struct {
 	policy          *policyengine.CompiledPolicy
 	findings        map[string]safetyv1alpha1.Finding
 	actions         map[string]safetyv1alpha1.RemediationAction
+	jsonSize        jsonSizeWriter
 	persistedBytes  int
 	omittedFindings int
 	omittedActions  int
+}
+
+type jsonSizeWriter struct {
+	bytes int
+}
+
+func (w *jsonSizeWriter) encodedSize(value any) (int, error) {
+	// Encoder.Encode produces the same escaped JSON as Marshal followed by one newline.
+	w.bytes = -1
+	err := json.NewEncoder(w).Encode(value)
+	return w.bytes, err
+}
+
+func (w *jsonSizeWriter) Write(encoded []byte) (int, error) {
+	w.bytes += len(encoded)
+	return len(encoded), nil
 }
 
 func newCollector(policy *policyengine.CompiledPolicy) *collector {
@@ -215,12 +232,12 @@ func (c *collector) addFinding(finding safetyv1alpha1.Finding) {
 	if _, exists := c.findings[finding.ID]; exists {
 		return
 	}
-	encoded, err := json.Marshal(finding)
-	if err != nil || len(c.findings) >= maxPersistedFindings || c.persistedBytes+len(encoded) > maxPersistedEvidenceBytes {
+	encodedSize, err := c.jsonSize.encodedSize(finding)
+	if err != nil || len(c.findings) >= maxPersistedFindings || c.persistedBytes+encodedSize > maxPersistedEvidenceBytes {
 		c.omittedFindings++
 		return
 	}
-	c.persistedBytes += len(encoded)
+	c.persistedBytes += encodedSize
 	c.findings[finding.ID] = finding
 }
 
@@ -228,12 +245,12 @@ func (c *collector) addAction(action safetyv1alpha1.RemediationAction) {
 	if _, exists := c.actions[action.ID]; exists {
 		return
 	}
-	encoded, err := json.Marshal(action)
-	if err != nil || len(c.actions) >= maxPersistedActions || c.persistedBytes+len(encoded) > maxPersistedEvidenceBytes {
+	encodedSize, err := c.jsonSize.encodedSize(action)
+	if err != nil || len(c.actions) >= maxPersistedActions || c.persistedBytes+encodedSize > maxPersistedEvidenceBytes {
 		c.omittedActions++
 		return
 	}
-	c.persistedBytes += len(encoded)
+	c.persistedBytes += encodedSize
 	c.actions[action.ID] = action
 }
 

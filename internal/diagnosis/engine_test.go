@@ -16,6 +16,7 @@ package diagnosis
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -991,6 +992,64 @@ func hasActionType(actions []safetyv1alpha1.RemediationAction, actionType safety
 		}
 	}
 	return false
+}
+
+func TestJSONSizeWriterMatchesMarshal(t *testing.T) {
+	count := int32(7)
+	values := []any{
+		safetyv1alpha1.Finding{
+			ID: "finding", Type: safetyv1alpha1.FindingUnknown,
+			Message: "escaped <html> & unicode \u2028 separator",
+			Count:   &count, Truncated: true,
+		},
+		safetyv1alpha1.RemediationAction{
+			ID: "action", Type: safetyv1alpha1.ActionRemoveResourceFinalizer,
+			Target:   safetyv1alpha1.TargetReference{APIGroup: "apps", Version: "v1", Resource: "deployments", Name: "demo", UID: "uid-demo"},
+			Eligible: true, Reason: "escaped <html> & unicode \u2029 separator",
+		},
+	}
+
+	var writer jsonSizeWriter
+	for _, value := range values {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal %T: %v", value, err)
+		}
+		got, err := writer.encodedSize(value)
+		if err != nil {
+			t.Fatalf("count encoded %T: %v", value, err)
+		}
+		if got != len(encoded) {
+			t.Fatalf("encoded size of %T = %d, want Marshal size %d", value, got, len(encoded))
+		}
+	}
+}
+
+func TestCollectorEnforcesExactJSONByteBudget(t *testing.T) {
+	finding := safetyv1alpha1.Finding{
+		Type:    safetyv1alpha1.FindingUnknown,
+		Message: "escaped <html> & unicode \u2028 separator",
+	}
+	persistedFinding := finding
+	persistedFinding.ID = findingID(persistedFinding)
+	encoded, err := json.Marshal(persistedFinding)
+	if err != nil {
+		t.Fatalf("marshal finding: %v", err)
+	}
+
+	atLimit := newCollector(nil)
+	atLimit.persistedBytes = maxPersistedEvidenceBytes - len(encoded)
+	atLimit.addFinding(finding)
+	if len(atLimit.findings) != 1 || atLimit.persistedBytes != maxPersistedEvidenceBytes || atLimit.omittedFindings != 0 {
+		t.Fatalf("finding at byte limit = retained:%d bytes:%d omitted:%d", len(atLimit.findings), atLimit.persistedBytes, atLimit.omittedFindings)
+	}
+
+	overLimit := newCollector(nil)
+	overLimit.persistedBytes = maxPersistedEvidenceBytes - len(encoded) + 1
+	overLimit.addFinding(finding)
+	if len(overLimit.findings) != 0 || overLimit.persistedBytes != maxPersistedEvidenceBytes-len(encoded)+1 || overLimit.omittedFindings != 1 {
+		t.Fatalf("finding over byte limit = retained:%d bytes:%d omitted:%d", len(overLimit.findings), overLimit.persistedBytes, overLimit.omittedFindings)
+	}
 }
 
 func TestCollectorCompactsPersistedEvidenceOverflow(t *testing.T) {
