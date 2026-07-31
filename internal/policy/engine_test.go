@@ -173,6 +173,32 @@ func TestInvalidSelectorsAndUnresolvedResourcesAreIgnored(t *testing.T) {
 	}
 }
 
+// Regression: accepted policies with many unresolved selections used to produce
+// status conditions exceeding metav1.Condition's 32,768-character API limit,
+// so the scanner could not persist the policy's failure status.
+func TestCompileBoundsConditionMessagesForPublicAPI(t *testing.T) {
+	const (
+		ruleCount                = 1500
+		conditionMessageAPILimit = 32_768
+	)
+
+	source := validPolicy("many-unresolved", 0, safetyv1alpha1.TargetRule{})
+	source.Spec.TargetRules = make([]safetyv1alpha1.TargetRule, ruleCount)
+	for index := range source.Spec.TargetRules {
+		source.Spec.TargetRules[index] = safetyv1alpha1.TargetRule{
+			APIGroups: []string{fmt.Sprintf("missing-%04d.example.io", index)},
+			Resources: []string{"widgets"},
+		}
+	}
+
+	_, status := Compile(source, testCatalog(t), time.Now())
+	for _, condition := range status.Conditions {
+		if got := len([]rune(condition.Message)); got > conditionMessageAPILimit {
+			t.Errorf("condition %s message has %d characters, exceeds public API limit %d", condition.Type, got, conditionMessageAPILimit)
+		}
+	}
+}
+
 func TestSelectWinningUsesPriorityThenLexicographicName(t *testing.T) {
 	catalog := testCatalog(t)
 	target := Target{GroupResource: schema.GroupResource{Resource: "pods"}, Namespaced: true}

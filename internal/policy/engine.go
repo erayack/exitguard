@@ -33,6 +33,9 @@ import (
 )
 
 const (
+	maxConditionMessageRunes        = 32_768
+	conditionMessageTruncatedSuffix = "... (truncated)"
+
 	// ConditionReady is true when a policy can participate in matching.
 	ConditionReady = "Ready"
 	// ConditionDiscoveryResolved is true when every explicit resource resolves.
@@ -455,7 +458,7 @@ func condition(conditionType string, generation int64, transitionTime metav1.Tim
 	if !valid {
 		status = metav1.ConditionFalse
 		reason = invalidReason
-		message = strings.Join(problems, "; ")
+		message = truncateConditionMessage(strings.Join(problems, "; "))
 	}
 	return metav1.Condition{
 		Type: conditionType, Status: status, ObservedGeneration: generation,
@@ -465,6 +468,15 @@ func condition(conditionType string, generation int64, transitionTime metav1.Tim
 
 func matchesToken(tokens []string, value string) bool {
 	return slices.Contains(tokens, "*") || slices.Contains(tokens, value)
+}
+
+func truncateConditionMessage(message string) string {
+	runes := []rune(message)
+	if len(runes) <= maxConditionMessageRunes {
+		return message
+	}
+	suffix := []rune(conditionMessageTruncatedSuffix)
+	return string(runes[:maxConditionMessageRunes-len(suffix)]) + conditionMessageTruncatedSuffix
 }
 
 func withoutWildcard(values []string) []string {
