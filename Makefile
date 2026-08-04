@@ -38,10 +38,13 @@ vet:
 test-unit: manifests generate fmt vet
 	$(GO) test ./... -coverprofile cover.out
 
-.PHONY: test
-test: manifests generate fmt vet envtest
+.PHONY: test-integration
+test-integration: manifests generate fmt vet envtest
 	KUBEBUILDER_ASSETS="$$( $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path )" \
-		$(GO) test ./... -coverprofile cover.out
+		$(GO) test -tags=integration ./test/integration -count=1
+
+.PHONY: test
+test: test-unit test-integration
 
 .PHONY: build
 build: manifests generate fmt vet

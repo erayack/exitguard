@@ -41,11 +41,15 @@ Build the image first with `make docker-build IMG=…`, then push via your usual
 ## Develop
 
 ```sh
-make test-unit    # unit tests
-make test         # envtest
-make test-e2e     # Kind E2E (report-only + remediation)
-make build        # bin/exitguard
+go test ./...          # fast Go test lane; no envtest assets required
+make test-unit         # fast lane plus generation, formatting, vet, and coverage
+make test-integration  # tagged envtest API/scanner/executor correctness suite
+make test              # test-unit followed by test-integration
+make test-e2e          # separate Kind E2E (report-only + remediation)
+make build             # bin/exitguard
 ```
+
+Routine CI runs the fast `go test ./...` lane, vet, formatting, and lint; it does not run envtest or Kind. Run `make test-integration` (or the combined `make test`) explicitly when changing API-server, scanner, or executor behavior.
 
 ## License
 

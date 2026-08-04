@@ -45,7 +45,7 @@ Artifacts are written under ignored `.perf/<UTC timestamp>-<mode>-<pid>/`:
 
 Comparison creates detached temporary worktrees for `BASE` and `HEAD`, places artifacts outside both, and removes the worktrees afterward. It compares committed revisions; uncommitted working-tree changes are deliberately not copied into the candidate. Every invocation is checked against the suite's explicit benchmark manifest and required sample count. Comparison also requires identical, non-empty benchmark sets, so missing, renamed, or asymmetric benchmarks stop the command before a summary is produced. Failed benchmarks, operation mismatches, or failed summaries also stop the command.
 
-The repository's envtest setup currently covers CRD admission validation only and has no reusable reconciliation benchmark fixture. Envtest performance coverage is therefore intentionally excluded. If added later, label and store it separately; never compare its latency directly with fake/stub or live-cluster results.
+The tagged envtest suite now provides real-API correctness coverage for CRD admission/defaulting, scanner persistence and incident creation, and executor dry-run/status/mutation behavior. It contains no benchmarks: envtest performance coverage remains intentionally excluded. If added later, keep it in a separate lane and label and store it as a distinct latency source; never compare its latency directly with fake/stub or live-cluster results.
 
 ## Profiles
 
