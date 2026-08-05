@@ -183,9 +183,10 @@ func TestUpdatePolicyStatusHandlesStaleListedObjects(t *testing.T) {
 			}
 			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "terminationpolicies"}, stale.Name, errors.New("stale listed policy"))
 		}
-		coordinator.writer = hookClient
+		runner := liveCycleRunnerForTest(t, coordinator)
+		runner.writer = hookClient
 
-		if err := coordinator.updatePolicyStatus(ctx, &stale, desired); err != nil {
+		if err := runner.updatePolicyStatus(ctx, &stale, desired); err != nil {
 			t.Fatalf("update policy status after conflict: %v", err)
 		}
 		var updated safetyv1alpha1.TerminationPolicy
@@ -215,9 +216,10 @@ func TestUpdatePolicyStatusHandlesStaleListedObjects(t *testing.T) {
 			}
 			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "terminationpolicies"}, stale.Name, errors.New("policy deleted"))
 		}
-		coordinator.writer = hookClient
+		runner := liveCycleRunnerForTest(t, coordinator)
+		runner.writer = hookClient
 
-		err := coordinator.updatePolicyStatus(ctx, &stale, desired)
+		err := runner.updatePolicyStatus(ctx, &stale, desired)
 		if !apierrors.IsNotFound(err) {
 			t.Fatalf("update after deletion error = %v, want NotFound", err)
 		}
@@ -240,7 +242,8 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 		if err := store.Get(ctx, client.ObjectKey{Name: "deletion-target-uid"}, &incident); err != nil {
 			t.Fatal(err)
 		}
-		compiled, err := coordinator.compilePolicies(ctx, coordinator.catalog.Snapshot(), *now)
+		runner := liveCycleRunnerForTest(t, coordinator)
+		compiled, err := runner.compilePolicies(ctx, runner.catalog.Snapshot(), *now)
 		if err != nil {
 			t.Fatalf("compile policy: %v", err)
 		}
@@ -285,9 +288,10 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 			}
 			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "deletionincidents"}, stale.Name, errors.New("stale incident snapshot"))
 		}
-		coordinator.writer = hookClient
+		runner := liveCycleRunnerForTest(t, coordinator)
+		runner.writer = hookClient
 
-		if err := coordinator.persistDiagnosis(ctx, observed, result, &stale, metricsDirty, time.Now().UTC()); err != nil {
+		if err := runner.persistDiagnosis(ctx, observed, result, &stale, metricsDirty, time.Now().UTC()); err != nil {
 			t.Fatalf("persist diagnosis after conflict: %v", err)
 		}
 		var updated safetyv1alpha1.DeletionIncident
@@ -315,9 +319,10 @@ func TestPersistDiagnosisHandlesStaleIncidentSnapshots(t *testing.T) {
 			}
 			return apierrors.NewConflict(schema.GroupResource{Group: safetyv1alpha1.GroupVersion.Group, Resource: "deletionincidents"}, stale.Name, errors.New("incident deleted"))
 		}
-		coordinator.writer = hookClient
+		runner := liveCycleRunnerForTest(t, coordinator)
+		runner.writer = hookClient
 
-		err := coordinator.persistDiagnosis(ctx, observed, result, &stale, metricsDirty, time.Now().UTC())
+		err := runner.persistDiagnosis(ctx, observed, result, &stale, metricsDirty, time.Now().UTC())
 		if !apierrors.IsNotFound(err) {
 			t.Fatalf("persist after deletion error = %v, want NotFound", err)
 		}
@@ -339,8 +344,9 @@ func TestRunCycleDoesNotRelistIncidentsForSamePhaseStatusRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	counter := &incidentListCountingReader{Reader: coordinator.reader}
-	coordinator.reader = counter
+	runner := liveCycleRunnerForTest(t, coordinator)
+	counter := &incidentListCountingReader{Reader: runner.reader}
+	runner.reader = counter
 	*now = now.Add(observationRefresh)
 	if err := coordinator.RunCycle(ctx); err != nil {
 		t.Fatalf("refresh cycle: %v", err)
@@ -360,14 +366,15 @@ func TestRunCycleDoesNotRelistIncidentsForSamePhaseStatusRefresh(t *testing.T) {
 
 func TestCompilePoliciesCacheMatchesFreshCompilationAndInvalidatesOnCatalogChange(t *testing.T) {
 	coordinator, _, store, now := testCoordinator(t)
+	runner := liveCycleRunnerForTest(t, coordinator)
 	ctx := context.Background()
-	catalog := coordinator.catalog.Snapshot()
-	first, err := coordinator.compilePolicies(ctx, catalog, *now)
+	catalog := runner.catalog.Snapshot()
+	first, err := runner.compilePolicies(ctx, catalog, *now)
 	if err != nil {
 		t.Fatalf("first compile: %v", err)
 	}
 	*now = now.Add(time.Minute)
-	cached, err := coordinator.compilePolicies(ctx, catalog, *now)
+	cached, err := runner.compilePolicies(ctx, catalog, *now)
 	if err != nil {
 		t.Fatalf("cached compile: %v", err)
 	}
@@ -400,7 +407,7 @@ func TestCompilePoliciesCacheMatchesFreshCompilationAndInvalidatesOnCatalogChang
 	}
 
 	changedCatalog := scannerTestCatalogSnapshot(t, metav1.APIResource{Name: "configmaps", SingularName: "configmap", Namespaced: true, Kind: "ConfigMap", Verbs: metav1.Verbs{"get", "list"}})
-	invalidated, err := coordinator.compilePolicies(ctx, changedCatalog, *now)
+	invalidated, err := runner.compilePolicies(ctx, changedCatalog, *now)
 	if err != nil {
 		t.Fatalf("compile after catalog change: %v", err)
 	}
@@ -425,7 +432,8 @@ func TestRunCycleSkipsDiagnosisSnapshotWithoutDeletingTargets(t *testing.T) {
 	if err := metadataClient.Resource(schema.GroupVersionResource{Version: "v1", Resource: "pods"}).Namespace("ns").Delete(ctx, "blocked", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	coordinator.reader = snapshotFailingReader{Reader: coordinator.reader}
+	runner := liveCycleRunnerForTest(t, coordinator)
+	runner.reader = snapshotFailingReader{Reader: runner.reader}
 	if err := coordinator.RunCycle(ctx); err != nil {
 		t.Fatalf("empty cycle built an unnecessary diagnosis snapshot: %v", err)
 	}
@@ -437,7 +445,7 @@ func TestSnapshotErrorClearsStaleRemediationActions(t *testing.T) {
 	if err := coordinator.RunCycle(ctx); err != nil {
 		t.Fatalf("initial cycle: %v", err)
 	}
-	coordinator.reader = snapshotFailingReader{Reader: store}
+	liveCycleRunnerForTest(t, coordinator).reader = snapshotFailingReader{Reader: store}
 	*now = now.Add(time.Minute)
 	if err := coordinator.RunCycle(ctx); err == nil {
 		t.Fatal("cycle with diagnosis snapshot failure returned nil error")
@@ -457,7 +465,7 @@ func TestOversizedDiagnosisFallsBackToCompactFailureStatus(t *testing.T) {
 	if err := coordinator.RunCycle(ctx); err != nil {
 		t.Fatalf("initial cycle: %v", err)
 	}
-	coordinator.writer = oversizedDiagnosisClient{Client: store}
+	liveCycleRunnerForTest(t, coordinator).writer = oversizedDiagnosisClient{Client: store}
 	*now = now.Add(time.Minute)
 	if err := coordinator.RunCycle(ctx); !apierrors.IsRequestEntityTooLargeError(err) {
 		t.Fatalf("oversized cycle error = %v, want request entity too large", err)
@@ -509,9 +517,10 @@ func TestDiagnosisErrorClearsStaleRemediationActions(t *testing.T) {
 		t.Fatal("initial diagnosis did not publish a remediation action")
 	}
 
-	counter := &incidentListCountingReader{Reader: coordinator.reader}
-	coordinator.reader = counter
-	coordinator.engine = diagnosis.NewEngine(failingDiagnosisReader{})
+	runner := liveCycleRunnerForTest(t, coordinator)
+	counter := &incidentListCountingReader{Reader: runner.reader}
+	runner.reader = counter
+	runner.engine = diagnosis.NewEngine(failingDiagnosisReader{})
 	*now = now.Add(time.Minute)
 	if err := coordinator.RunCycle(ctx); err == nil {
 		t.Fatal("cycle with diagnosis GET failure returned nil error")
@@ -563,7 +572,7 @@ func TestRunCycleListsOnlyPolicySelectedResources(t *testing.T) {
 
 func TestRawInventoryDoesNotConsumeTargetBound(t *testing.T) {
 	coordinator, metadataClient, store, now := testCoordinator(t)
-	coordinator.config.MaxTargets = 1
+	liveCycleRunnerForTest(t, coordinator).config.MaxTargets = 1
 	deleting := metav1.NewTime(now.Add(-10 * time.Minute))
 	calls := 0
 	metadataClient.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -599,13 +608,13 @@ func TestListResourceFallsBackToAlternateServedVersion(t *testing.T) {
 		}
 		return true, fakeMetadataList(""), nil
 	})
-	coordinator := &Coordinator{metadata: metadataClient, config: Config{PageSize: 10, MaxTargets: 1}}
+	runner := &liveCycleRunner{metadata: metadataClient, config: Config{PageSize: 10, MaxTargets: 1}}
 	resource := catalogdiscovery.Resource{
 		GroupResource:     schema.GroupResource{Group: "example.io", Resource: "widgets"},
 		PreferredVersion:  catalogdiscovery.Version{Version: "v1", Kind: "Widget", Namespaced: true},
 		AlternateVersions: []catalogdiscovery.Version{{Version: "v1beta1", Kind: "Widget", Namespaced: true}},
 	}
-	_, used, err := coordinator.listResource(context.Background(), resource, compiledPolicies{}, nil, trackedTargets{}, &targetBudget{maximum: 1, reserved: map[types.UID]struct{}{}})
+	_, used, err := runner.listResource(context.Background(), resource, compiledPolicies{}, nil, trackedTargets{}, &targetBudget{maximum: 1, reserved: map[types.UID]struct{}{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,6 +707,23 @@ func TestIncidentActionIDsTrackRefreshedEvidence(t *testing.T) {
 	}
 }
 
+func TestRunCycleDelegatesUTCTimestamp(t *testing.T) {
+	zone := time.FixedZone("test", 3*60*60)
+	localNow := time.Date(2026, 1, 2, 6, 4, 5, 0, zone)
+	runner := &recordingCycleRunner{}
+	coordinator := &Coordinator{runner: runner, now: func() time.Time { return localNow }}
+
+	if err := coordinator.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1", runner.calls)
+	}
+	if runner.now.Location() != time.UTC || !runner.now.Equal(localNow) {
+		t.Fatalf("runner timestamp = %s (%s), want UTC instant %s", runner.now, runner.now.Location(), localNow.UTC())
+	}
+}
+
 func TestRunCycleRejectsOverlap(t *testing.T) {
 	coordinator, _, _, _ := testCoordinator(t)
 	coordinator.cycleMu.Lock()
@@ -705,6 +731,15 @@ func TestRunCycleRejectsOverlap(t *testing.T) {
 	if err := coordinator.RunCycle(context.Background()); err == nil {
 		t.Fatal("expected overlapping cycle rejection")
 	}
+}
+
+func liveCycleRunnerForTest(t *testing.T, coordinator *Coordinator) *liveCycleRunner {
+	t.Helper()
+	runner, ok := coordinator.runner.(*liveCycleRunner)
+	if !ok {
+		t.Fatalf("coordinator runner = %T, want *liveCycleRunner", coordinator.runner)
+	}
+	return runner
 }
 
 func testCoordinator(t *testing.T) (*Coordinator, *metadatafake.FakeMetadataClient, client.Client, *time.Time) {
@@ -782,6 +817,17 @@ func fakeMetadataList(continueToken string, items ...metav1.PartialObjectMetadat
 		list.Items[i] = runtime.RawExtension{Object: &item}
 	}
 	return list
+}
+
+type recordingCycleRunner struct {
+	calls int
+	now   time.Time
+}
+
+func (r *recordingCycleRunner) Run(_ context.Context, now time.Time) error {
+	r.calls++
+	r.now = now
+	return nil
 }
 
 type incidentListCountingReader struct {
