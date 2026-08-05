@@ -43,24 +43,49 @@ type Version struct {
 	Version    string
 	Kind       string
 	Namespaced bool
-	Verbs      []string
+	verbs      []string
+}
+
+// Verbs returns the sorted operations exposed by this served representation.
+func (v Version) Verbs() []string {
+	return append([]string(nil), v.verbs...)
 }
 
 // Resource describes one listable/gettable GroupResource without duplicating versions.
+// Its slice-backed metadata is established only by this package and remains immutable.
 type Resource struct {
-	GroupResource     schema.GroupResource
-	PreferredVersion  Version
-	AlternateVersions []Version
+	GroupResource    schema.GroupResource
+	PreferredVersion Version
+	alternates       []Version
+}
+
+func newResource(groupResource schema.GroupResource, preferred Version, alternates []Version) Resource {
+	resource := newResourceOwned(groupResource, cloneVersion(preferred), make([]Version, len(alternates)))
+	for i := range alternates {
+		resource.alternates[i] = cloneVersion(alternates[i])
+	}
+	return resource
+}
+
+// newResourceOwned is limited to construction paths that exclusively own all
+// supplied slice backing until newSnapshot takes its detached copy.
+func newResourceOwned(groupResource schema.GroupResource, preferred Version, alternates []Version) Resource {
+	return Resource{GroupResource: groupResource, PreferredVersion: preferred, alternates: alternates}
+}
+
+// AlternateVersions returns a detached copy of the non-preferred representations.
+func (r Resource) AlternateVersions() []Version {
+	return append([]Version(nil), r.alternates...)
 }
 
 // Supports reports whether the selected preferred version exposes verb.
 func (r Resource) Supports(verb string) bool {
-	return slices.Contains(r.PreferredVersion.Verbs, verb)
+	return slices.Contains(r.PreferredVersion.verbs, verb)
 }
 
 // OrderedVersions returns each served representation once, preferring requested when available.
 func (r Resource) OrderedVersions(requested string) []Version {
-	versions := make([]Version, 0, 1+len(r.AlternateVersions))
+	versions := make([]Version, 0, 1+len(r.alternates))
 	appendVersion := func(candidate Version) {
 		if slices.ContainsFunc(versions, func(existing Version) bool { return existing.Version == candidate.Version }) {
 			return
@@ -71,14 +96,14 @@ func (r Resource) OrderedVersions(requested string) []Version {
 		if r.PreferredVersion.Version == requested {
 			appendVersion(r.PreferredVersion)
 		}
-		for _, alternate := range r.AlternateVersions {
+		for _, alternate := range r.alternates {
 			if alternate.Version == requested {
 				appendVersion(alternate)
 			}
 		}
 	}
 	appendVersion(r.PreferredVersion)
-	for _, alternate := range r.AlternateVersions {
+	for _, alternate := range r.alternates {
 		appendVersion(alternate)
 	}
 	return versions
@@ -101,10 +126,10 @@ func (s Snapshot) Resources() []Resource {
 	return cloneResources(s.ordered)
 }
 
-// Resolve returns the metadata for gr.
+// Resolve returns the immutable metadata for gr.
 func (s Snapshot) Resolve(gr schema.GroupResource) (Resource, bool) {
 	resource, found := s.resources[gr]
-	return cloneResource(resource), found
+	return resource, found
 }
 
 // Len returns the number of unique GroupResources.
@@ -241,7 +266,7 @@ func buildSnapshot(groups []*metav1.APIGroup, lists []*metav1.APIResourceList) (
 				Version:    groupVersion.Version,
 				Kind:       apiResource.Kind,
 				Namespaced: apiResource.Namespaced,
-				Verbs:      verbs,
+				verbs:      verbs,
 			})
 		}
 	}
@@ -249,11 +274,7 @@ func buildSnapshot(groups []*metav1.APIGroup, lists []*metav1.APIResourceList) (
 	resources := make([]Resource, 0, len(versionsByResource))
 	for gr, versions := range versionsByResource {
 		orderVersions(versions, preferences[gr.Group])
-		resources = append(resources, Resource{
-			GroupResource:     gr,
-			PreferredVersion:  versions[0],
-			AlternateVersions: append([]Version(nil), versions[1:]...),
-		})
+		resources = append(resources, newResourceOwned(gr, versions[0], versions[1:]))
 	}
 	sort.Slice(resources, func(i, j int) bool {
 		return resources[i].GroupResource.String() < resources[j].GroupResource.String()
@@ -325,10 +346,10 @@ func cloneResources(resources []Resource) []Resource {
 }
 
 func cloneResource(resource Resource) Resource {
-	resource.PreferredVersion.Verbs = append([]string(nil), resource.PreferredVersion.Verbs...)
-	resource.AlternateVersions = append([]Version(nil), resource.AlternateVersions...)
-	for i := range resource.AlternateVersions {
-		resource.AlternateVersions[i].Verbs = append([]string(nil), resource.AlternateVersions[i].Verbs...)
-	}
-	return resource
+	return newResource(resource.GroupResource, resource.PreferredVersion, resource.alternates)
+}
+
+func cloneVersion(version Version) Version {
+	version.verbs = append([]string(nil), version.verbs...)
+	return version
 }

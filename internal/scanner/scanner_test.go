@@ -609,10 +609,18 @@ func TestListResourceFallsBackToAlternateServedVersion(t *testing.T) {
 		return true, fakeMetadataList(""), nil
 	})
 	runner := &liveCycleRunner{metadata: metadataClient, config: Config{PageSize: 10, MaxTargets: 1}}
-	resource := catalogdiscovery.Resource{
-		GroupResource:     schema.GroupResource{Group: "example.io", Resource: "widgets"},
-		PreferredVersion:  catalogdiscovery.Version{Version: "v1", Kind: "Widget", Namespaced: true},
-		AlternateVersions: []catalogdiscovery.Version{{Version: "v1beta1", Kind: "Widget", Namespaced: true}},
+	discovery := &fake.FakeDiscovery{Fake: &k8stesting.Fake{}}
+	discovery.Resources = []*metav1.APIResourceList{
+		{GroupVersion: "example.io/v1", APIResources: []metav1.APIResource{{Name: "widgets", Kind: "Widget", Namespaced: true, Verbs: metav1.Verbs{"get", "list"}}}},
+		{GroupVersion: "example.io/v1beta1", APIResources: []metav1.APIResource{{Name: "widgets", Kind: "Widget", Namespaced: true, Verbs: metav1.Verbs{"get", "list"}}}},
+	}
+	catalog := catalogdiscovery.NewCatalog(discovery, time.Hour, logr.Discard())
+	if err := catalog.Refresh(); err != nil {
+		t.Fatalf("refresh discovery catalog: %v", err)
+	}
+	resource, found := catalog.Snapshot().Resolve(schema.GroupResource{Group: "example.io", Resource: "widgets"})
+	if !found {
+		t.Fatal("widgets discovery metadata was not resolved")
 	}
 	_, used, err := runner.listResource(context.Background(), resource, compiledPolicies{}, nil, trackedTargets{}, &targetBudget{maximum: 1, reserved: map[types.UID]struct{}{}})
 	if err != nil {

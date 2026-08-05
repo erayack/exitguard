@@ -68,7 +68,7 @@ func BenchmarkDiscoverySnapshotBuild(b *testing.B) {
 				b.Fatalf("snapshot resources = %d, want %d", snapshot.Len(), wantResources)
 			}
 			for _, resource := range snapshot.Resources() {
-				if resource.PreferredVersion.Version != "v1" || len(resource.AlternateVersions) != 1 {
+				if resource.PreferredVersion.Version != "v1" || len(resource.AlternateVersions()) != 1 {
 					b.Fatalf("unexpected versions for %s: %#v", resource.GroupResource, resource)
 				}
 			}

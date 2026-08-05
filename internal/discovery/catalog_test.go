@@ -76,8 +76,9 @@ func TestCatalogVersionSelectionAndFiltering(t *testing.T) {
 	if got, want := widgets.PreferredVersion.Kind, "Widget"; got != want {
 		t.Errorf("preferred kind = %q, want %q", got, want)
 	}
-	if len(widgets.AlternateVersions) != 1 || widgets.AlternateVersions[0].Version != "v1beta1" {
-		t.Errorf("alternate versions = %#v, want v1beta1", widgets.AlternateVersions)
+	alternates := widgets.AlternateVersions()
+	if len(alternates) != 1 || alternates[0].Version != "v1beta1" {
+		t.Errorf("alternate versions = %#v, want v1beta1", alternates)
 	}
 	ordered := widgets.OrderedVersions("v1beta1")
 	if len(ordered) != 2 || ordered[0].Version != "v1beta1" || ordered[1].Version != "v1" {
@@ -104,6 +105,48 @@ func TestCatalogVersionSelectionAndFiltering(t *testing.T) {
 		if resource.EligibleForWildcard() {
 			t.Errorf("high-churn resource %s is wildcard eligible", gr)
 		}
+	}
+}
+
+func TestResolvedResourceKeepsSnapshotBackingPrivate(t *testing.T) {
+	preferredVerbs := []string{"get", "list"}
+	alternateVerbs := []string{"get", "list", "watch"}
+	alternates := []Version{{Version: "v1beta1", Kind: "WidgetBeta", Namespaced: true, verbs: alternateVerbs}}
+	resource := newResource(
+		schema.GroupResource{Group: "apps.example.io", Resource: "widgets"},
+		Version{Version: "v1", Kind: "Widget", Namespaced: true, verbs: preferredVerbs},
+		alternates,
+	)
+	snapshot := newSnapshot([]Resource{resource})
+
+	preferredVerbs[0] = "delete"
+	alternateVerbs[0] = "delete"
+	alternates[0].Version = "mutated"
+
+	resolved, found := snapshot.Resolve(resource.GroupResource)
+	if !found {
+		t.Fatal("resource was not resolved")
+	}
+	verbs := resolved.PreferredVersion.Verbs()
+	versions := resolved.AlternateVersions()
+	verbs[0] = "patch"
+	versions[0].Version = "mutated-again"
+	alternateCopy := versions[0].Verbs()
+	alternateCopy[0] = "patch"
+
+	again, found := snapshot.Resolve(resource.GroupResource)
+	if !found {
+		t.Fatal("resource disappeared after caller mutations")
+	}
+	if got := again.PreferredVersion.Verbs(); len(got) != 2 || got[0] != "get" {
+		t.Fatalf("preferred verbs leaked mutable backing: %#v", got)
+	}
+	gotAlternates := again.AlternateVersions()
+	if len(gotAlternates) != 1 || gotAlternates[0].Version != "v1beta1" {
+		t.Fatalf("alternate versions leaked mutable backing: %#v", gotAlternates)
+	}
+	if got := gotAlternates[0].Verbs(); len(got) != 3 || got[0] != "get" {
+		t.Fatalf("alternate verbs leaked mutable backing: %#v", got)
 	}
 }
 

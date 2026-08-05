@@ -1,5 +1,6 @@
 /bin/
 /cover.out
+/test/prometheus/rendered-rules.yaml
 /.envtest/
 /.perf/
 .DS_Store

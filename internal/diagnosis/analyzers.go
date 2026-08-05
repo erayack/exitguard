@@ -598,7 +598,7 @@ func ruleMatches(request Request, rule admissionv1.RuleWithOperations, matchPoli
 		return false
 	}
 	versions := []string{catalogResource.PreferredVersion.Version}
-	for _, alternate := range catalogResource.AlternateVersions {
+	for _, alternate := range catalogResource.AlternateVersions() {
 		versions = append(versions, alternate.Version)
 	}
 	return slices.ContainsFunc(versions, func(version string) bool {
