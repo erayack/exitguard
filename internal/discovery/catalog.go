@@ -256,7 +256,7 @@ func buildSnapshot(groups []*metav1.APIGroup, lists []*metav1.APIResourceList) (
 			return Snapshot{}, fmt.Errorf("parse discovered groupVersion %q: %w", list.GroupVersion, err)
 		}
 		for _, apiResource := range list.APIResources {
-			if strings.Contains(apiResource.Name, "/") || !hasVerb(apiResource.Verbs, "get") || !hasVerb(apiResource.Verbs, "list") {
+			if strings.Contains(apiResource.Name, "/") || !slices.Contains(apiResource.Verbs, "get") || !slices.Contains(apiResource.Verbs, "list") {
 				continue
 			}
 			verbs := append([]string(nil), apiResource.Verbs...)
@@ -322,10 +322,6 @@ func orderVersions(versions []Version, preference map[string]int) {
 		}
 		return versions[i].Version < versions[j].Version
 	})
-}
-
-func hasVerb(verbs metav1.Verbs, wanted string) bool {
-	return slices.Contains(verbs, wanted)
 }
 
 func newSnapshot(resources []Resource) Snapshot {

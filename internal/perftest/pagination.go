@@ -69,10 +69,11 @@ func pageOffset(token string, length int) (int, error) {
 	if token == "" {
 		return 0, nil
 	}
-	if !strings.HasPrefix(token, continuePrefix) {
+	value, found := strings.CutPrefix(token, continuePrefix)
+	if !found {
 		return 0, fmt.Errorf("invalid continue token %q", token)
 	}
-	offset, err := strconv.Atoi(strings.TrimPrefix(token, continuePrefix))
+	offset, err := strconv.Atoi(value)
 	if err != nil || offset <= 0 || offset >= length {
 		return 0, fmt.Errorf("invalid continue token %q", token)
 	}

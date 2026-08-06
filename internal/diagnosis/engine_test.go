@@ -111,8 +111,8 @@ func TestGenericDiagnosisProducesDeterministicEvidence(t *testing.T) {
 	snapshot := Snapshot{
 		Catalog: catalog,
 		APIServices: []apiregistrationv1.APIService{
-			unavailableAPIService("v1.apps.example.io", "apps.example.io", "v1"),
-			unavailableAPIService("v1.other.example.io", "other.example.io", "v1"),
+			unavailableAPIService("v1.apps.example.io", "apps.example.io"),
+			unavailableAPIService("v1.other.example.io", "other.example.io"),
 		},
 		ValidatingWebhooks: []admissionv1.ValidatingWebhookConfiguration{{
 			ObjectMeta: metav1.ObjectMeta{Name: "guard"},
@@ -198,7 +198,7 @@ func TestFindingMessagesRespectAPIMaxLength(t *testing.T) {
 	catalog := diagnosisCatalog(t)
 	policy := diagnosisPolicy(t, catalog, policyOptions{})
 	targetRef := widgetReference()
-	apiService := unavailableAPIService("v1.apps.example.io", "apps.example.io", "v1")
+	apiService := unavailableAPIService("v1.apps.example.io", "apps.example.io")
 	apiService.Status.Conditions[0].Message = strings.Repeat("evidence", 200)
 
 	result, err := NewEngine(&fakeReader{target: deletingObject(targetRef, testNow.Add(-time.Hour), nil)}).Diagnose(context.Background(), Request{
@@ -255,7 +255,7 @@ func TestNamespaceDiagnosisEnumeratesMetadataAndReportsTruncation(t *testing.T) 
 	}
 	snapshot := Snapshot{
 		Catalog:     catalog,
-		APIServices: []apiregistrationv1.APIService{unavailableAPIService("v1.unrelated.example.io", "unrelated.example.io", "v1")},
+		APIServices: []apiregistrationv1.APIService{unavailableAPIService("v1.unrelated.example.io", "unrelated.example.io")},
 	}
 	result, err := NewEngine(reader).Diagnose(context.Background(), Request{Target: targetRef, Policy: policy, Snapshot: snapshot, Now: testNow})
 	if err != nil {
@@ -396,7 +396,7 @@ func TestCRDDiagnosisDeduplicatesVersionsAndGatesCleanupAction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed-evidence Diagnose() error: %v", err)
 	}
-	if failed.DiagnosisComplete || hasActionType(failed.Actions, safetyv1alpha1.ActionRemoveCRDFinalizer) {
+	if failed.DiagnosisComplete || hasCRDFinalizerAction(failed.Actions) {
 		t.Fatalf("incomplete evidence produced cleanup action: %#v", failed)
 	}
 	assertFindingTypeAtLeast(t, failed.Findings, safetyv1alpha1.FindingDiscoveryFailure, 1)
@@ -407,7 +407,7 @@ func TestCRDDiagnosisDeduplicatesVersionsAndGatesCleanupAction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unavailable-conversion Diagnose() error: %v", err)
 	}
-	if unavailableConversion.DiagnosisComplete || hasActionType(unavailableConversion.Actions, safetyv1alpha1.ActionRemoveCRDFinalizer) {
+	if unavailableConversion.DiagnosisComplete || hasCRDFinalizerAction(unavailableConversion.Actions) {
 		t.Fatalf("unavailable conversion backend produced cleanup action: %#v", unavailableConversion)
 	}
 	assertFindingTypeCount(t, unavailableConversion.Findings, safetyv1alpha1.FindingBlockingWebhook, 1)
@@ -484,7 +484,7 @@ func TestCRDDiagnosisBoundsInstanceEvidence(t *testing.T) {
 			t.Fatalf("over-limit evidence was not marked incomplete and truncated: %#v", result.Findings)
 		}
 		assertEvidenceCounts(t, result, 2, 0)
-		if hasActionType(result.Actions, safetyv1alpha1.ActionRemoveCRDFinalizer) {
+		if hasCRDFinalizerAction(result.Actions) {
 			t.Fatalf("truncated evidence published CRD cleanup action: %#v", result.Actions)
 		}
 
@@ -505,7 +505,7 @@ func TestCRDDiagnosisBoundsInstanceEvidence(t *testing.T) {
 			t.Fatalf("missing-UID overflow was not marked incomplete and truncated: %#v", result.Findings)
 		}
 		assertEvidenceCounts(t, result, 0, 2)
-		if hasActionType(result.Actions, safetyv1alpha1.ActionRemoveCRDFinalizer) {
+		if hasCRDFinalizerAction(result.Actions) {
 			t.Fatalf("missing-UID overflow published CRD cleanup action: %#v", result.Actions)
 		}
 	})
@@ -858,10 +858,10 @@ func deletingObject(reference safetyv1alpha1.TargetReference, deletionTime time.
 	return object
 }
 
-func unavailableAPIService(name, group, version string) apiregistrationv1.APIService {
+func unavailableAPIService(name, group string) apiregistrationv1.APIService {
 	return apiregistrationv1.APIService{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec:       apiregistrationv1.APIServiceSpec{Group: group, Version: version},
+		Spec:       apiregistrationv1.APIServiceSpec{Group: group, Version: "v1"},
 		Status: apiregistrationv1.APIServiceStatus{Conditions: []apiregistrationv1.APIServiceCondition{{
 			Type: apiregistrationv1.Available, Status: apiregistrationv1.ConditionFalse, Message: "backend unavailable",
 		}}},
@@ -985,9 +985,9 @@ func assertAction(t *testing.T, actions []safetyv1alpha1.RemediationAction, acti
 	t.Errorf("action %s for UID %s not found in %#v", actionType, uid, actions)
 }
 
-func hasActionType(actions []safetyv1alpha1.RemediationAction, actionType safetyv1alpha1.RemediationActionType) bool {
+func hasCRDFinalizerAction(actions []safetyv1alpha1.RemediationAction) bool {
 	for _, action := range actions {
-		if action.Type == actionType {
+		if action.Type == safetyv1alpha1.ActionRemoveCRDFinalizer {
 			return true
 		}
 	}

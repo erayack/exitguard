@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"sort"
 	"sync"
@@ -241,7 +242,7 @@ func (c *liveCycleRunner) namespaceLabels(ctx context.Context) (map[string]map[s
 			return nil, fmt.Errorf("list namespace metadata: %w", err)
 		}
 		for i := range list.Items {
-			labelsByNamespace[list.Items[i].Name] = cloneMap(list.Items[i].Labels)
+			labelsByNamespace[list.Items[i].Name] = maps.Clone(list.Items[i].Labels)
 		}
 		continueToken = list.Continue
 		if continueToken == "" {
@@ -935,13 +936,6 @@ func policyUID(ref *safetyv1alpha1.PolicyReference) types.UID {
 		return ""
 	}
 	return ref.UID
-}
-func cloneMap(source map[string]string) map[string]string {
-	result := make(map[string]string, len(source))
-	for key, value := range source {
-		result[key] = value
-	}
-	return result
 }
 func listResult(err error) string {
 	switch {

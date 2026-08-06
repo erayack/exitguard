@@ -29,25 +29,26 @@ for command in docker kind kubectl go; do
   command -v "${command}" >/dev/null || { printf 'required command not found: %s\n' "${command}" >&2; exit 1; }
 done
 
+configure_scanner() {
+  kubectl -n exitguard-system set image deployment/exitguard-scanner manager="${IMAGE}"
+  kubectl -n exitguard-system patch deployment exitguard-scanner --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--scan-interval=2s"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--discovery-refresh-interval=5s"}]'
+  kubectl -n exitguard-system rollout status deployment/exitguard-scanner --timeout=180s
+}
+
 docker build -t "${IMAGE}" .
 kind create cluster --name "${CLUSTER_NAME}" --image "${KIND_NODE_IMAGE}" --kubeconfig "${KUBECONFIG_FILE}" --wait 120s
 kind load docker-image "${IMAGE}" --name "${CLUSTER_NAME}"
 export KUBECONFIG="${KUBECONFIG_FILE}"
 
 kubectl apply -k config/default
-kubectl -n exitguard-system set image deployment/exitguard-scanner manager="${IMAGE}"
-kubectl -n exitguard-system patch deployment exitguard-scanner --type=json \
-  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--scan-interval=2s"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--discovery-refresh-interval=5s"}]'
-kubectl -n exitguard-system rollout status deployment/exitguard-scanner --timeout=180s
+configure_scanner
 E2E_PHASE=report-only go test ./test/e2e -count=1 -timeout=5m
 
 if [[ "${PROFILE}" == "remediation" ]]; then
   kubectl apply -k config/remediation
-  kubectl -n exitguard-system set image deployment/exitguard-scanner manager="${IMAGE}"
-  kubectl -n exitguard-system patch deployment exitguard-scanner --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--scan-interval=2s"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--discovery-refresh-interval=5s"}]'
+  configure_scanner
   kubectl -n exitguard-system set image deployment/exitguard-executor manager="${IMAGE}"
-  kubectl -n exitguard-system rollout status deployment/exitguard-scanner --timeout=180s
   kubectl -n exitguard-system rollout status deployment/exitguard-executor --timeout=180s
   E2E_PHASE=remediation go test ./test/e2e -count=1 -timeout=20m
 fi

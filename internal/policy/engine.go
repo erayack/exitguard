@@ -277,12 +277,6 @@ func RiskFor(action safetyv1alpha1.RemediationActionType, finalizer string) safe
 	}
 }
 
-// AllowsAction applies compiled remediation limits to an operator-classified action.
-func (p *CompiledPolicy) AllowsAction(action safetyv1alpha1.RemediationActionType, finalizer string) bool {
-	allowed, _ := p.ActionEligibility(action, finalizer)
-	return allowed
-}
-
 // ActionEligibility returns the policy decision and its stable ineligibility reason.
 func (p *CompiledPolicy) ActionEligibility(action safetyv1alpha1.RemediationActionType, finalizer string) (bool, string) {
 	if !p.Ready() {
@@ -368,7 +362,7 @@ func unresolvedSelections(index int, rule safetyv1alpha1.TargetRule, catalog cat
 	}
 	if groupWildcard {
 		for _, resource := range exactResources {
-			if !anyResource(resources, func(candidate catalogdiscovery.Resource) bool {
+			if !slices.ContainsFunc(resources, func(candidate catalogdiscovery.Resource) bool {
 				return candidate.GroupResource.Resource == resource
 			}) {
 				unresolved = append(unresolved, formatSelection(index, "*", resource))
@@ -377,13 +371,13 @@ func unresolvedSelections(index int, rule safetyv1alpha1.TargetRule, catalog cat
 	}
 	if resourceWildcard {
 		for _, group := range exactGroups {
-			if !anyResource(resources, func(candidate catalogdiscovery.Resource) bool {
+			if !slices.ContainsFunc(resources, func(candidate catalogdiscovery.Resource) bool {
 				return candidate.GroupResource.Group == group && candidate.EligibleForWildcard()
 			}) {
 				unresolved = append(unresolved, formatSelection(index, group, "*"))
 			}
 		}
-		if groupWildcard && !anyResource(resources, func(candidate catalogdiscovery.Resource) bool {
+		if groupWildcard && !slices.ContainsFunc(resources, func(candidate catalogdiscovery.Resource) bool {
 			return candidate.EligibleForWildcard()
 		}) {
 			unresolved = append(unresolved, formatSelection(index, "*", "*"))
@@ -487,15 +481,6 @@ func withoutWildcard(values []string) []string {
 		}
 	}
 	return result
-}
-
-func anyResource(resources []catalogdiscovery.Resource, predicate func(catalogdiscovery.Resource) bool) bool {
-	for _, resource := range resources {
-		if predicate(resource) {
-			return true
-		}
-	}
-	return false
 }
 
 func formatSelection(index int, group, resource string) string {

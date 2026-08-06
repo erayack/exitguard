@@ -14,10 +14,7 @@
 
 package v1alpha1
 
-import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-)
+import "k8s.io/apimachinery/pkg/types"
 
 // RiskLevel describes the irreversible impact of a remediation action.
 // +kubebuilder:validation:Enum=None;Low;Medium;High;Critical
@@ -253,6 +250,3 @@ type RemediationAction struct {
 	// +kubebuilder:validation:MaxLength=1024
 	Reason string `json:"reason"`
 }
-
-// Conditions is the canonical condition list shape used by all APIs.
-type Conditions []metav1.Condition

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -471,7 +472,7 @@ func (f *executorBenchmarkFixture) verify(tb testing.TB) {
 		}
 		return
 	}
-	if finalizerIndex(current.GetFinalizers(), f.action.Finalizer) >= 0 {
+	if slices.Contains(current.GetFinalizers(), f.action.Finalizer) {
 		f.fail(tb, "target finalizer persisted after patch: %v", current.GetFinalizers())
 	}
 }

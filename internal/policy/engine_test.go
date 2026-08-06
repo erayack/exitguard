@@ -243,23 +243,24 @@ func TestRiskOrderingAndRemediationLimits(t *testing.T) {
 	source.Spec.Remediation.AllowedFinalizers = []string{"example.io/cleanup", metav1.FinalizerDeleteDependents}
 	source.Spec.Remediation.AllowNamespaceForce = true
 	compiled, _ := Compile(source, catalog, time.Now())
-	if !compiled.AllowsAction(safetyv1alpha1.ActionRemoveResourceFinalizer, "example.io/cleanup") {
-		t.Error("ordinary allowlisted finalizer should be eligible at Medium")
+	eligibilityTests := []struct {
+		name, finalizer string
+		action          safetyv1alpha1.RemediationActionType
+		wantAllowed     bool
+		wantReason      string
+	}{
+		{name: "ordinary allowlisted", action: safetyv1alpha1.ActionRemoveResourceFinalizer, finalizer: "example.io/cleanup", wantAllowed: true},
+		{name: "protective finalizer risk", action: safetyv1alpha1.ActionRemoveResourceFinalizer, finalizer: metav1.FinalizerDeleteDependents, wantReason: "action risk High exceeds policy maxRisk Medium"},
+		{name: "not allowlisted", action: safetyv1alpha1.ActionRemoveResourceFinalizer, finalizer: "other.example.io/cleanup", wantReason: "finalizer is not in policy allowedFinalizers"},
+		{name: "namespace risk", action: safetyv1alpha1.ActionForceFinalizeNamespace, wantReason: "action risk Critical exceeds policy maxRisk Medium"},
 	}
-	if compiled.AllowsAction(safetyv1alpha1.ActionRemoveResourceFinalizer, metav1.FinalizerDeleteDependents) {
-		t.Error("policy lowered fixed High foreground risk")
-	}
-	if compiled.AllowsAction(safetyv1alpha1.ActionRemoveResourceFinalizer, "other.example.io/cleanup") {
-		t.Error("non-allowlisted finalizer was eligible")
-	}
-	if compiled.AllowsAction(safetyv1alpha1.ActionForceFinalizeNamespace, "") {
-		t.Error("Critical namespace finalization was eligible at Medium")
-	}
-	if allowed, reason := compiled.ActionEligibility(safetyv1alpha1.ActionRemoveResourceFinalizer, "other.example.io/cleanup"); allowed || reason != "finalizer is not in policy allowedFinalizers" {
-		t.Errorf("non-allowlisted eligibility = (%v, %q)", allowed, reason)
-	}
-	if allowed, reason := compiled.ActionEligibility(safetyv1alpha1.ActionRemoveResourceFinalizer, metav1.FinalizerDeleteDependents); allowed || reason != "action risk High exceeds policy maxRisk Medium" {
-		t.Errorf("high-risk eligibility = (%v, %q)", allowed, reason)
+	for _, test := range eligibilityTests {
+		t.Run(test.name, func(t *testing.T) {
+			allowed, reason := compiled.ActionEligibility(test.action, test.finalizer)
+			if allowed != test.wantAllowed || reason != test.wantReason {
+				t.Errorf("ActionEligibility() = (%v, %q), want (%v, %q)", allowed, reason, test.wantAllowed, test.wantReason)
+			}
+		})
 	}
 }
 

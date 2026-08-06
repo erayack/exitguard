@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -204,7 +206,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		if err := r.recordTerminalAttempt(ctx, approval.Name, attempt, safetyv1alpha1.ApprovalPhaseSucceeded, outcome); err != nil {
 			return ctrl.Result{}, err
 		}
-		remediations.WithLabelValues(string(action.Type), string(action.Risk), string(outcome), boolLabel(approval.Spec.DryRun)).Inc()
+		remediations.WithLabelValues(string(action.Type), string(action.Risk), string(outcome), strconv.FormatBool(approval.Spec.DryRun)).Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -261,7 +263,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		if statusErr := r.recordTerminalAttempt(ctx, approval.Name, attempt, phase, outcome); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		remediations.WithLabelValues(string(action.Type), string(action.Risk), string(outcome), boolLabel(approval.Spec.DryRun)).Inc()
+		remediations.WithLabelValues(string(action.Type), string(action.Risk), string(outcome), strconv.FormatBool(approval.Spec.DryRun)).Inc()
 		r.recorder.Eventf(&approval, nil, corev1.EventTypeNormal, "RemediationCompleted", "ExecuteRemediation", "%s completed with %s", action.Type, outcome)
 		return ctrl.Result{}, nil
 	}
@@ -273,7 +275,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		if statusErr := r.recordTerminalAttempt(ctx, approval.Name, attempt, terminalErr.phase, terminalErr.result); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		remediations.WithLabelValues(string(action.Type), string(action.Risk), string(terminalErr.result), boolLabel(approval.Spec.DryRun)).Inc()
+		remediations.WithLabelValues(string(action.Type), string(action.Risk), string(terminalErr.result), strconv.FormatBool(approval.Spec.DryRun)).Inc()
 		r.recorder.Eventf(&approval, nil, corev1.EventTypeWarning, "RemediationRejected", "ExecuteRemediation", "%s ended with %s", action.Type, terminalErr.result)
 		return ctrl.Result{}, nil
 	}
@@ -283,13 +285,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if statusErr := r.recordRetryAttempt(ctx, approval.Name, attempt); statusErr != nil {
 		return ctrl.Result{}, statusErr
 	}
-	remediations.WithLabelValues(string(action.Type), string(action.Risk), string(safetyv1alpha1.ApprovalResultAPIError), boolLabel(approval.Spec.DryRun)).Inc()
+	remediations.WithLabelValues(string(action.Type), string(action.Risk), string(safetyv1alpha1.ApprovalResultAPIError), strconv.FormatBool(approval.Spec.DryRun)).Inc()
 	if !transient(err) || len(approval.Status.Attempts)+1 >= r.maxAttempts {
-		return r.finishByName(ctx, approval.Name, safetyv1alpha1.ApprovalPhaseFailed, safetyv1alpha1.ApprovalResultAPIError, errorReason(err), "remediation failed")
+		return ctrl.Result{}, r.finishByName(ctx, approval.Name, safetyv1alpha1.ApprovalPhaseFailed, safetyv1alpha1.ApprovalResultAPIError, errorReason(err), "remediation failed")
 	}
 	remaining := expires.Sub(r.now().UTC())
 	if remaining <= 0 {
-		return r.finishByName(ctx, approval.Name, safetyv1alpha1.ApprovalPhaseExpired, safetyv1alpha1.ApprovalResultAPIError, "ApprovalExpired", "approval expired after a failed attempt")
+		return ctrl.Result{}, r.finishByName(ctx, approval.Name, safetyv1alpha1.ApprovalPhaseExpired, safetyv1alpha1.ApprovalResultAPIError, "ApprovalExpired", "approval expired after a failed attempt")
 	}
 	delay := retryDelay
 	if seconds, suggested := apierrors.SuggestsClientDelay(err); suggested {
@@ -329,7 +331,7 @@ func (r *Reconciler) execute(ctx context.Context, action *safetyv1alpha1.Remedia
 		if action.Type == safetyv1alpha1.ActionRemoveCRDFinalizer && (action.Target.APIGroup != "apiextensions.k8s.io" || action.Target.Resource != "customresourcedefinitions") {
 			return attempt, "", terminalExecutionError{phase: safetyv1alpha1.ApprovalPhaseFailed, result: safetyv1alpha1.ApprovalResultRejectedByPolicy, reason: "InvalidAction", message: "CRD finalizer action target is invalid"}
 		}
-		index := finalizerIndex(current.GetFinalizers(), action.Finalizer)
+		index := slices.Index(current.GetFinalizers(), action.Finalizer)
 		if index < 0 {
 			return attempt, safetyv1alpha1.ApprovalResultAlreadySatisfied, nil
 		}
@@ -427,7 +429,7 @@ func (r *Reconciler) verifySatisfied(ctx context.Context, action *safetyv1alpha1
 	}
 	switch action.Type {
 	case safetyv1alpha1.ActionRemoveResourceFinalizer, safetyv1alpha1.ActionRemoveCRDFinalizer:
-		return attempt, safetyv1alpha1.ApprovalResultAlreadySatisfied, finalizerIndex(current.GetFinalizers(), action.Finalizer) < 0, nil
+		return attempt, safetyv1alpha1.ApprovalResultAlreadySatisfied, !slices.Contains(current.GetFinalizers(), action.Finalizer), nil
 	case safetyv1alpha1.ActionForceFinalizeNamespace:
 		finalizers, found, err := unstructured.NestedStringSlice(current.Object, "spec", "finalizers")
 		if err != nil {
@@ -538,14 +540,14 @@ func (r *Reconciler) recordTerminalAttempt(ctx context.Context, name string, att
 }
 
 func (r *Reconciler) finish(ctx context.Context, approval *safetyv1alpha1.RemediationApproval, phase safetyv1alpha1.ApprovalPhase, result safetyv1alpha1.ApprovalResult, reason, message string) (ctrl.Result, error) {
-	outcome, err := r.finishByName(ctx, approval.Name, phase, result, reason, message)
+	err := r.finishByName(ctx, approval.Name, phase, result, reason, message)
 	if err == nil {
 		r.recorder.Eventf(approval, nil, corev1.EventTypeWarning, "ApprovalRejected", "RejectApproval", "%s: %s", sanitize(reason, 128), sanitize(message, 768))
 	}
-	return outcome, err
+	return ctrl.Result{}, err
 }
-func (r *Reconciler) finishByName(ctx context.Context, name string, phase safetyv1alpha1.ApprovalPhase, result safetyv1alpha1.ApprovalResult, reason, message string) (ctrl.Result, error) {
-	err := r.updateStatus(ctx, name, func(status *safetyv1alpha1.RemediationApprovalStatus, generation int64) {
+func (r *Reconciler) finishByName(ctx context.Context, name string, phase safetyv1alpha1.ApprovalPhase, result safetyv1alpha1.ApprovalResult, reason, message string) error {
+	return r.updateStatus(ctx, name, func(status *safetyv1alpha1.RemediationApprovalStatus, generation int64) {
 		status.Phase = phase
 		status.Result = result
 		status.ObservedGeneration = generation
@@ -553,7 +555,6 @@ func (r *Reconciler) finishByName(ctx context.Context, name string, phase safety
 		status.CompletedTime = &now
 		status.Conditions = []metav1.Condition{{Type: "Completed", Status: metav1.ConditionTrue, Reason: sanitize(reason, 128), Message: sanitize(message, 1024), LastTransitionTime: now, ObservedGeneration: generation}}
 	})
-	return ctrl.Result{}, err
 }
 
 func (r *Reconciler) updateStatus(ctx context.Context, name string, mutate func(*safetyv1alpha1.RemediationApprovalStatus, int64)) error {
@@ -603,14 +604,6 @@ func actionBelongsToIncident(action *safetyv1alpha1.RemediationAction, incidentT
 		action.Target.UID != "" && action.Target.Name != "" && action.Target.Resource != ""
 }
 
-func finalizerIndex(finalizers []string, wanted string) int {
-	for i, value := range finalizers {
-		if value == wanted {
-			return i
-		}
-	}
-	return -1
-}
 func targetKey(target safetyv1alpha1.TargetReference) string {
 	return strings.Join([]string{target.APIGroup, target.Resource, target.Namespace, target.Name, string(target.UID)}, "\x00")
 }
@@ -630,12 +623,6 @@ func appendBounded(attempts []safetyv1alpha1.RemediationAttempt, attempt safetyv
 		attempts = attempts[len(attempts)-maxAuditAttempts:]
 	}
 	return attempts
-}
-func boolLabel(value bool) string {
-	if value {
-		return "true"
-	}
-	return "false"
 }
 func sanitize(value string, maximum int) string {
 	value = strings.Map(func(r rune) rune {
